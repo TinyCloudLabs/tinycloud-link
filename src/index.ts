@@ -43,7 +43,6 @@ const acmeIssuer = new DnsO1AcmeIssuer({
   accountKeyPem,
   email: acmeEmail,
   dnsProvider,
-  challengePropagationDelayMs: 5000,
 });
 
 const app = createServer({

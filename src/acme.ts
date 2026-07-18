@@ -1,6 +1,7 @@
 import { X509Certificate } from "node:crypto";
 import * as acme from "acme-client";
 import type { DnsProvider } from "./dns/provider.js";
+import { waitForTxtPropagation } from "./dns/propagation.js";
 
 export interface AcmeIssueResult {
   certChainPem: string;
@@ -63,8 +64,12 @@ export interface DnsO1AcmeIssuerOptions {
   email: string;
   dnsProvider: DnsProvider;
   clientFactory?: AcmeClientFactory;
-  /** Delay after publishing the DNS-01 TXT record, before asking the CA to validate. */
-  challengePropagationDelayMs?: number;
+  /**
+   * Confirms the _acme-challenge TXT record is actually visible in DNS before asking the CA to
+   * validate it. Defaults to polling real DNS (see ./dns/propagation.ts); tests inject a fake to
+   * avoid network calls.
+   */
+  checkPropagation?: (recordName: string, expectedValue: string) => Promise<void>;
 }
 
 /** Issues a certificate via ACME DNS-01, brokering the challenge through a DnsProvider. */
@@ -104,9 +109,7 @@ export class DnsO1AcmeIssuer implements AcmeIssuer {
         const record = await this.opts.dnsProvider.createTxtRecord(recordName, keyAuthorization);
         cleanups.push(() => this.opts.dnsProvider.deleteTxtRecord(recordName, record.id));
 
-        if (this.opts.challengePropagationDelayMs) {
-          await sleep(this.opts.challengePropagationDelayMs);
-        }
+        await (this.opts.checkPropagation ?? waitForTxtPropagation)(recordName, keyAuthorization);
 
         await client.completeChallenge(challenge);
         await client.waitForValidStatus(challenge);
@@ -123,10 +126,6 @@ export class DnsO1AcmeIssuer implements AcmeIssuer {
       }
     }
   }
-}
-
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 function extractNotAfter(certChainPem: string): string {

@@ -14,6 +14,7 @@ test("issues a certificate via DNS-01 using a fake acme-client and in-memory DNS
     email: "ops@tinycloud.xyz",
     dnsProvider,
     clientFactory: () => fakeClient,
+    checkPropagation: async () => {},
   });
 
   const domain = "mynode.local.tinycloud.link";
@@ -43,11 +44,37 @@ test("cleans up the DNS-01 TXT record even if the ACME order fails", async () =>
     email: "ops@tinycloud.xyz",
     dnsProvider,
     clientFactory: () => fakeClient,
+    checkPropagation: async () => {},
   });
 
   const domain = "failingnode.local.tinycloud.link";
   const csr = createTestCsr(domain);
 
   await assert.rejects(() => issuer.issueCertificate({ csrPem: csr, domain }));
+  assert.equal(dnsProvider.txtRecords.size, 0);
+});
+
+test("cleans up the DNS-01 TXT record and never completes the challenge if propagation never becomes visible", async () => {
+  const dnsProvider = new InMemoryDnsProvider();
+  const fakeClient = new FakeAcmeClient();
+  const issuer = new DnsO1AcmeIssuer({
+    directoryUrl: "https://fake-acme.test/directory",
+    accountKeyPem: "fake-account-key",
+    email: "ops@tinycloud.xyz",
+    dnsProvider,
+    clientFactory: () => fakeClient,
+    checkPropagation: async () => {
+      throw new Error("timed out after 120000ms waiting for TXT record to propagate");
+    },
+  });
+
+  const domain = "unpropagated.local.tinycloud.link";
+  const csr = createTestCsr(domain);
+
+  await assert.rejects(
+    () => issuer.issueCertificate({ csrPem: csr, domain }),
+    /timed out.*propagate/
+  );
+  assert.equal(fakeClient.completedChallenges.length, 0);
   assert.equal(dnsProvider.txtRecords.size, 0);
 });

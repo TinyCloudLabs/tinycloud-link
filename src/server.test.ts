@@ -26,6 +26,7 @@ function buildApp(options: { nameUpdateRateLimitPerDay?: number } = {}) {
     email: "ops@tinycloud.xyz",
     dnsProvider,
     clientFactory: () => fakeAcmeClient,
+    checkPropagation: async () => {},
   });
   const app = createServer({
     nameStore,
