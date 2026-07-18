@@ -61,6 +61,9 @@ export function validateNameLabel(name: unknown): string {
       "name must be a dns-safe label (lowercase letters, digits, hyphens; cannot start or end with a hyphen)"
     );
   }
+  if (lower.startsWith("xn--")) {
+    throw new NameError('name must not be a punycode ("xn--") label');
+  }
   if (RESERVED_NAMES.has(lower)) {
     throw new NameError(`name "${lower}" is reserved`);
   }
@@ -263,8 +266,9 @@ export async function verifyCertRequest(record: CertRequestRecord): Promise<bool
 }
 
 /**
- * Enforces that the CSR's CN and every SAN dNSName entry is exactly the
- * expected <name>.local.tinycloud.link domain -- nothing broader, nothing else.
+ * Enforces that the CSR's CN and its complete SAN set is exactly the
+ * expected <name>.local.tinycloud.link domain as a single dNSName entry --
+ * nothing broader, nothing else, no SAN entries of any other type.
  */
 export function assertCsrMatchesDomain(csrPem: string, expectedDomain: string): void {
   let csr: forge.pki.CertificateSigningRequest;
@@ -281,9 +285,16 @@ export function assertCsrMatchesDomain(csrPem: string, expectedDomain: string): 
   const sanExtension = (extensionRequest?.extensions ?? []).find(
     (ext: { name?: string }) => ext.name === "subjectAltName"
   ) as { altNames?: Array<{ type: number; value: string }> } | undefined;
-  const sanNames = (sanExtension?.altNames ?? [])
-    .filter((entry) => entry.type === 2) // dNSName
-    .map((entry) => entry.value);
+  const altNames = sanExtension?.altNames ?? [];
+  for (const entry of altNames) {
+    if (entry.type !== 2) {
+      // 2 = dNSName
+      throw new NameError(
+        `csr subjectAltName must contain only a dNSName entry for ${expectedDomain} (found an entry of type ${entry.type})`
+      );
+    }
+  }
+  const sanNames = altNames.map((entry) => entry.value);
 
   const names = new Set<string>([...(cn ? [cn] : []), ...sanNames]);
 

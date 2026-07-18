@@ -10,6 +10,7 @@ import {
   validateCertRequest,
   validateNameClaim,
   validateNameDelete,
+  validateNameLabel,
   verifyCertRequest,
   verifyNameClaim,
   verifyNameDelete,
@@ -157,6 +158,23 @@ test("rejects names with invalid dns characters", () => {
   );
 });
 
+test("rejects punycode (xn--) labels", () => {
+  assert.throws(() => validateNameLabel("xn--nxasmq6b"), /punycode/);
+  assert.throws(
+    () =>
+      validateNameClaim({
+        version: 1,
+        action: "claim",
+        name: "xn--nxasmq6b",
+        subject: "did:key:z6MkiFake",
+        lanIps: ["10.0.0.1"],
+        sequence: 1,
+        signature: "sig",
+      }),
+    /punycode/
+  );
+});
+
 test("rejects reserved names", () => {
   for (const reserved of ["api", "www", "admin", "acme"]) {
     assert.throws(
@@ -258,4 +276,10 @@ test("csr domain check rejects a csr with extra SAN entries", () => {
   const domain = fqdnForName("mynode");
   const csr = createTestCsr(domain, [domain, "evil.example.com"]);
   assert.throws(() => assertCsrMatchesDomain(csr, domain), NameError);
+});
+
+test("csr domain check rejects a csr with a non-dNSName SAN entry", () => {
+  const domain = fqdnForName("mynode");
+  const csr = createTestCsr(domain, [domain, { type: 7, ip: "8.8.8.8" }]); // iPAddress
+  assert.throws(() => assertCsrMatchesDomain(csr, domain), /only a dNSName entry/);
 });

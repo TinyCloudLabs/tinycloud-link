@@ -15,7 +15,7 @@ import { FakeAcmeClient } from "./test-support/fake-acme-client.js";
 import { InMemoryCertRateLimiter, InMemoryNameStore } from "./test-support/memory-stores.js";
 import { didKeySigner, type Signer } from "./test-support/signing.js";
 
-function buildApp() {
+function buildApp(options: { nameUpdateRateLimitPerDay?: number } = {}) {
   const nameStore = new InMemoryNameStore();
   const dnsProvider = new InMemoryDnsProvider();
   const rateLimiter = new InMemoryCertRateLimiter();
@@ -33,6 +33,7 @@ function buildApp() {
     acmeIssuer,
     rateLimiter,
     certRateLimitPerDay: 2,
+    nameUpdateRateLimitPerDay: options.nameUpdateRateLimitPerDay,
   });
   return { app, dnsProvider };
 }
@@ -107,6 +108,19 @@ test("same subject can update lanIps with a higher sequence", async () => {
   const res = await claim(app, "office", signer, ["192.168.1.77"], 2);
   assert.equal(res.status, 200);
   assert.deepEqual(dnsProvider.addressRecords.get(fqdnForName("office")), ["192.168.1.77"]);
+});
+
+test("enforces the daily name update rate limit per name", async () => {
+  const { app, dnsProvider } = buildApp({ nameUpdateRateLimitPerDay: 2 });
+  const signer = didKeySigner(38);
+  const first = await claim(app, "hammered", signer, ["192.168.1.19"], 1);
+  const second = await claim(app, "hammered", signer, ["192.168.1.20"], 2);
+  const third = await claim(app, "hammered", signer, ["192.168.1.21"], 3);
+  assert.equal(first.status, 201);
+  assert.equal(second.status, 200);
+  assert.equal(third.status, 429);
+  // The DNS provider was not touched by the rate-limited update.
+  assert.deepEqual(dnsProvider.addressRecords.get(fqdnForName("hammered")), ["192.168.1.20"]);
 });
 
 test("rejects a stale sequence update", async () => {

@@ -24,11 +24,19 @@ export interface ServerConfig {
   rateLimiter: CertRateLimiter;
   attestationDocument?: string;
   certRateLimitPerDay?: number;
+  nameUpdateRateLimitPerDay?: number;
+}
+
+// Prefixes name-update entries so they share the cert rate-limit store without
+// colliding with cert issuances (claimed names can never contain a colon).
+function nameUpdateRateLimitKey(name: string): string {
+  return `name-update:${name}`;
 }
 
 export function createServer(config: ServerConfig): Hono {
   const app = new Hono();
   const rateLimit = config.certRateLimitPerDay ?? 5;
+  const nameUpdateRateLimit = config.nameUpdateRateLimitPerDay ?? 30;
 
   app.get("/health", (c) => c.json({ ok: true }));
 
@@ -80,6 +88,14 @@ export function createServer(config: ServerConfig): Hono {
       return c.json({ error: "invalid record signature" }, 401);
     }
 
+    const recentUpdates = await config.rateLimiter.countRecentIssuances(
+      nameUpdateRateLimitKey(claim.name),
+      DAY_MS
+    );
+    if (recentUpdates >= nameUpdateRateLimit) {
+      return c.json({ error: "name update rate limit exceeded for this name" }, 429);
+    }
+
     const status = await config.nameStore.put({
       name: claim.name,
       subject: claim.subject,
@@ -92,6 +108,7 @@ export function createServer(config: ServerConfig): Hono {
     }
 
     await config.dnsProvider.upsertAddressRecords(fqdnForName(claim.name), claim.lanIps);
+    await config.rateLimiter.recordIssuance(nameUpdateRateLimitKey(claim.name));
 
     return c.json(
       { name: claim.name, subject: claim.subject, lanIps: claim.lanIps, status },
