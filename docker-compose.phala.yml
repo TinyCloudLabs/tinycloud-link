@@ -1,0 +1,55 @@
+services:
+  # Public HTTPS ingress for the control-plane API itself. This is separate
+  # from the *.local.tinycloud.link zone the service manages for nodes: the
+  # API is reachable at a normal public hostname (api.tinycloud.link), not a
+  # LAN-only name. Wiring api.tinycloud.link's DNS to this deployment's
+  # dstack gateway is a human step -- see README.md "Deploy to Phala".
+  dstack-ingress:
+    image: dstacktee/dstack-ingress:20250924@sha256:40429d78060ef3066b5f93676bf3ba7c2e9ac47d4648440febfdda558aed4b32
+    ports:
+      - "443:443"
+    environment:
+      - DOMAIN=api.tinycloud.link
+      - TARGET_ENDPOINT=http://tinycloud-link:3000
+      - CLOUDFLARE_API_TOKEN=${CLOUDFLARE_API_TOKEN}
+      - GATEWAY_DOMAIN=_.${DSTACK_GATEWAY_DOMAIN}
+      - CERTBOT_EMAIL=${CERTBOT_EMAIL}
+      - SET_CAA=true
+    volumes:
+      - /var/run/dstack.sock:/var/run/dstack.sock
+      - tinycloud-link-cert-data:/etc/letsencrypt
+    restart: unless-stopped
+
+  tinycloud-link:
+    image: ghcr.io/tinycloudlabs/tinycloud-link:main
+    environment:
+      - PORT=3000
+      - DATABASE_URL=postgres://tinycloud_link:${POSTGRES_PASSWORD}@postgres:5432/tinycloud_link
+      - CLOUDFLARE_API_TOKEN=${CLOUDFLARE_API_TOKEN}
+      - CLOUDFLARE_ZONE_ID=${CLOUDFLARE_ZONE_ID}
+      - ACME_EMAIL=${ACME_EMAIL}
+      - ACME_DIRECTORY=${ACME_DIRECTORY:-https://acme-staging-v02.api.letsencrypt.org/directory}
+      - ATTESTATION_DOCUMENT=${ATTESTATION_DOCUMENT:-}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      - POSTGRES_DB=tinycloud_link
+      - POSTGRES_USER=tinycloud_link
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+    volumes:
+      - tinycloud-link-postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U tinycloud_link -d tinycloud_link"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+volumes:
+  tinycloud-link-cert-data:
+  tinycloud-link-postgres-data:
