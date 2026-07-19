@@ -1,15 +1,38 @@
 services:
-  # Public HTTPS ingress for the control-plane API itself. This is separate
-  # from the *.local.tinycloud.link zone the service manages for nodes: the
-  # API is reachable at a normal public hostname (api.tinycloud.link), not a
-  # LAN-only name. Wiring api.tinycloud.link's DNS to this deployment's
-  # dstack gateway is a human step -- see README.md "Deploy to Phala".
+  # Public HTTPS ingress, for BOTH the control-plane API itself
+  # (api.tinycloud.link) and every tunnel name (<name>.tinycloud.link, the
+  # TC-85 remote-reachability namespace -- distinct from the LAN-only
+  # *.local.tinycloud.link zone the service also manages via DNS, which never
+  # goes through this ingress).
+  #
+  # dstack-ingress is an HAProxy-based L4 (TCP) proxy: it terminates TLS with
+  # its own ACME DNS-01 flow and forwards the decrypted stream to
+  # TARGET_ENDPOINT untouched, Host header and all. It natively supports a
+  # WILDCARD `DOMAIN` (one ACME order for *.tinycloud.link instead of one
+  # order per name), which is why DOMAIN is a wildcard below rather than the
+  # single api.tinycloud.link host used before TC-85: any single-label
+  # subdomain of tinycloud.link -- api.tinycloud.link, mynode.tinycloud.link,
+  # anything a node claims -- is covered by the same cert and forwarded to
+  # the same tinycloud-link process, which then routes by Host header
+  # (api.tinycloud.link -> the normal /v1 API; anything else -> the matching
+  # tunnel, see src/tunnel/host-router.ts). No per-name ACME order, no TLS
+  # termination inside this repo's process at all.
+  #
+  # CONSTRAINT (unverified, must be confirmed before this is deployed):
+  # dstack-ingress's own docs say wildcard DOMAIN "requires dstack-gateway
+  # with wildcard TXT resolution support" (Dstack-TEE/dstack#545). Whether
+  # this deployment's dstack-gateway includes that support cannot be checked
+  # from this repo/sandbox. If it doesn't, the ACME order for *.tinycloud.link
+  # will fail at bootstrap and this config falls back to the single-domain
+  # form (`DOMAIN=api.tinycloud.link`, i.e. no change from before TC-85) --
+  # see README.md "Ingress and TLS for tunnels" for that fallback and why a
+  # per-name-cert-at-the-relay design was considered and rejected.
   dstack-ingress:
     image: dstacktee/dstack-ingress:20250924@sha256:40429d78060ef3066b5f93676bf3ba7c2e9ac47d4648440febfdda558aed4b32
     ports:
       - "443:443"
     environment:
-      - DOMAIN=api.tinycloud.link
+      - DOMAIN=*.tinycloud.link
       - TARGET_ENDPOINT=http://tinycloud-link:3000
       - CLOUDFLARE_API_TOKEN=${CLOUDFLARE_API_TOKEN}
       - GATEWAY_DOMAIN=_.${DSTACK_GATEWAY_DOMAIN}
@@ -30,6 +53,7 @@ services:
       - ACME_EMAIL=${ACME_EMAIL}
       - ACME_DIRECTORY=${ACME_DIRECTORY:-https://acme-staging-v02.api.letsencrypt.org/directory}
       - ATTESTATION_DOCUMENT=${ATTESTATION_DOCUMENT:-}
+      - API_HOSTNAME=${API_HOSTNAME:-api.tinycloud.link}
     depends_on:
       postgres:
         condition: service_healthy

@@ -52,6 +52,8 @@ PUT    /v1/names/:name
 DELETE /v1/names/:name
 
 POST   /v1/certs/:name
+
+WS     /v1/tunnel/:name    (see "Remote reachability: the tunnel relay" below)
 ```
 
 ### `PUT /v1/names/:name`
@@ -103,6 +105,81 @@ Public, unsigned. Returns `{ name, subject, lanIps, updatedAt }` or `404`.
 - Opens an ACME order against `ACME_DIRECTORY` (Let's Encrypt staging by default), completes it via DNS-01 through the configured `DnsProvider`, finalizes with the node's CSR, and returns `{ certChainPem, notAfter }`.
 - The private key backing the CSR is generated and held by the node. It is never transmitted to or stored by this service.
 
+## Remote reachability: the tunnel relay
+
+`*.local.tinycloud.link` only works on the node's own LAN. The tunnel relay (TC-85) adds a second, **remote** namespace for the same names: `https://<name>.tinycloud.link` (the apex zone, no `.local.`) is reachable from anywhere on the internet and is served by this process relaying each HTTPS request down a WebSocket the node itself opened. The node never needs an inbound port, a public IP, or NAT configuration -- it dials **out** to the relay and keeps that one socket alive.
+
+There is one name registry with two surfaces: a name claimed via `PUT /v1/names/:name` gets LAN A/AAAA records (`<name>.local.tinycloud.link`) *and* the right to open a tunnel for `<name>.tinycloud.link`. Same owner, same signing key, same sequence counter.
+
+### Lifecycle
+
+```
+   node                                      relay (this service)
+    |                                             |
+    |  1. WebSocket connect                       |
+    |----- wss://api.tinycloud.link/v1/tunnel/<name> ---->|
+    |                                             |
+    |  2. auth frame (first WS message, JSON)     |
+    |-------------------------------------------->|  verifies: name is claimed,
+    |     {version, action:"tunnel", name,        |  subject owns it, sequence >
+    |      subject, sequence, signature}          |  stored, signature valid;
+    |                                             |  then persists the new sequence
+    |  3. ack frame                               |
+    |<--------------------------------------------|  {"type":"ack"}  tunnel is live
+    |                                             |
+    |  ... for each HTTPS request to              |
+    |      https://<name>.tinycloud.link ...      |
+    |                                             |
+    |  4. request + requestBody frames            |
+    |<--------------------------------------------|
+    |  5. response + responseBody frames          |
+    |-------------------------------------------->|
+    |                                             |
+    |  (relay pings every 30s; the node's WS      |
+    |   stack must answer pongs or the socket     |
+    |   is terminated as dead)                    |
+```
+
+- **Auth** (`src/names.ts` `TunnelAuthRecord`, enforced in `src/tunnel/upgrade.ts`): the first WS message must be a JSON record signed exactly like every other write -- canonical payload `{"version":1,"action":"tunnel","name":...,"subject":...,"sequence":...}` (fixed key order, `signature` field excluded from the signed bytes), same did:pkh (EIP-191) / did:key (Ed25519, base64url signature) schemes, `sequence` strictly greater than the name record's stored sequence. On success the stored sequence is bumped (same bump-before-side-effect pattern as the cert flow) and the relay sends `{"type":"ack"}`. The node has 5 seconds from socket open to deliver the auth frame.
+- **Close codes on rejection** (RFC 6455 private-use range): `4400` malformed auth frame or frame `name` != URL name, `4401` invalid signature, `4403` subject does not own the name, `4404` name not claimed, `4408` auth timeout, `4409` stale sequence, `4410` superseded by a newer connection for the same name.
+- **One socket per name, newest wins** (`src/tunnel/registry.ts`): a second authenticated connection for the same name evicts the first (close `4410`) rather than being rejected -- a node reconnecting after a network blip must be able to take over from its own half-dead previous socket. (Each reconnect needs a fresh auth frame with a higher sequence.)
+- **Keep-alive**: the relay pings every 30s and terminates the socket if the previous ping got no pong. Standard WS libraries answer pings automatically; a Rust client must confirm its library does (tungstenite does).
+
+### Frame protocol
+
+Defined in `src/tunnel/protocol.ts` -- that file is the source of truth for the Rust node client. Every frame is one JSON **text** message (binary WS messages are never used); body bytes travel base64-encoded inside the JSON. After the ack, the frames are:
+
+| frame | direction | fields |
+|---|---|---|
+| `request` | relay → node | `id` (UUID string), `method`, `path` (path + query, always starts with `/`), `headers` (string map; `Host` and hop-by-hop headers stripped) |
+| `requestBody` | relay → node | `id`, `chunk` (base64, may be `""`), `done` (bool) |
+| `response` | node → relay | `id`, `status` (int), `headers` (string map) |
+| `responseBody` | node → relay | `id`, `chunk` (base64, may be `""`), `done` (bool) |
+| `error` | either direction | `message`, optional `id` (fails just that request without closing the socket) |
+
+Rules a node client must follow:
+
+- Requests are multiplexed: frames for different `id`s interleave freely on the one socket. Echo the request's `id` on every frame you send for it.
+- The relay sends `request` first, then at least one `requestBody` (currently exactly one carrying the whole body with `done: true`, but a client must tolerate multiple chunks and treat `done: true` as the boundary).
+- The node replies with exactly one `response` frame, then one or more `responseBody` frames ending with `done: true`. An empty body is still one frame: `{"type":"responseBody","id":...,"chunk":"","done":true}`.
+- If the node cannot serve a request it sends `{"type":"error","id":...,"message":...}`; the relay answers the HTTP caller with `502`. The relay applies a 30s per-request timeout (caller gets `504`).
+- HTTP callers with no live tunnel for their Host get `502` directly from the relay.
+
+### Ingress and TLS for tunnels
+
+TLS for `https://<name>.tinycloud.link` terminates **at the relay's front door, with one wildcard certificate** -- not with per-name certificates, and not inside this Node process.
+
+The constraint that forces this: on Phala, this service runs behind `dstack-ingress` (see `docker-compose.phala.yml`), an HAProxy-based L4 TCP proxy that terminates TLS itself using its own certbot/DNS-01 machinery and forwards the decrypted stream to `TARGET_ENDPOINT`. Everything arriving on the CVM's public `:443` goes through it. From inside the CVM there is no per-SNI certificate hook: this repo's process never sees the TLS handshake, and `dstack-ingress` serves the certificates *it* obtained at bootstrap, not ones handed to it at runtime by another container. So the "extend the ACME issuer to obtain a cert for each `<name>.tinycloud.link` on tunnel registration" design is a dead end in this deployment model -- this process could *obtain* those certs (it already has the DNS-01 machinery), but nothing here could ever *serve* them. Design honesty: we don't ship per-name relay certs.
+
+What ships instead:
+
+- `dstack-ingress` runs with `DOMAIN=*.tinycloud.link` -- it supports wildcard domains natively (wildcard DNS-01 order, `issuewild` CAA). One certificate covers `api.tinycloud.link` and every tunnel name.
+- DNS needs one wildcard record: `*.tinycloud.link` → the same dstack gateway target `api.tinycloud.link` already points at (human step, same as the original `api` wiring). Tunnels create **no** per-name DNS records; the per-name records this service writes remain what they always were -- LAN A/AAAA under `*.local.tinycloud.link`.
+- Behind the ingress, this process routes by `Host` header (`src/tunnel/host-router.ts`): `API_HOSTNAME` (default `api.tinycloud.link`) gets the normal `/v1` API; any other single-label `<name>.tinycloud.link` host is looked up in the tunnel registry and proxied.
+- **Open verification item**: dstack-ingress documents that wildcard `DOMAIN` requires dstack-gateway wildcard TXT resolution support ([dstack#545](https://github.com/Dstack-TEE/dstack/pull/545)). Whether the production gateway has it can't be verified from this repo. If it doesn't, the wildcard ACME order fails at ingress bootstrap; the fallback is `DOMAIN=api.tinycloud.link` (control-plane API keeps working exactly as today, tunnels stay dark) until the gateway supports it. Must be checked on a staging CVM before the tunnel-enabled image is deployed.
+
+Trade-offs accepted: all tunnel names share one certificate (one CT-log entry for `*.tinycloud.link` rather than a per-name entry -- strictly *less* name disclosure than the LAN cert flow, which CT-logs every name); and tunnel TLS terminates in the ingress container rather than end-to-end at the node, meaning plaintext HTTP crosses the CVM-internal hop between ingress and this process -- the same boundary the control-plane API traffic has always crossed.
+
 ## DNS provider
 
 `src/dns/provider.ts` defines the `DnsProvider` interface (`upsertAddressRecords`, `deleteAddressRecords`, `createTxtRecord`, `deleteTxtRecord`). `src/dns/cloudflare.ts` is the production implementation against the Cloudflare API (zone id + token from env). `src/dns/memory.ts` is an in-memory fake used by tests -- no test ever makes a live DNS or ACME call.
@@ -153,7 +230,7 @@ docker run -p 3000:3000 --env-file .env tinycloud/tinycloud-link
    - `ACME_EMAIL`
    - `CERTBOT_EMAIL` (used by `dstack-ingress` for the API's own front-door cert)
    - `DSTACK_GATEWAY_DOMAIN`
-4. Point `api.tinycloud.link` at the deployment's dstack gateway (human DNS step, same pattern as `registry.tinycloud.xyz`).
+4. Point `api.tinycloud.link` at the deployment's dstack gateway (human DNS step, same pattern as `registry.tinycloud.xyz`). For tunnels (TC-85), also point the wildcard `*.tinycloud.link` at the same gateway target and confirm the gateway supports wildcard TXT resolution for the ingress's wildcard cert order -- see "Ingress and TLS for tunnels" above.
 5. Verify:
    ```bash
    curl https://api.tinycloud.link/health
