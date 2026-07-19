@@ -207,8 +207,8 @@ async function main() {
   console.log(`  ${issuer}`);
   console.log(`  ${subjectLine.replace("\n", "\n  ")}`);
   console.log(`  chain written to ${certPath}`);
-  if (!issuer.toUpperCase().includes("STAGING")) {
-    fail(`expected a Let's Encrypt STAGING issuer, got: ${issuer}`);
+  if (issuer.toUpperCase().includes("STAGING")) {
+    fail(`expected a production Let's Encrypt issuer, got: ${issuer}`);
   }
 
   // 4. delete
