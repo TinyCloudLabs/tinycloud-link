@@ -9,6 +9,17 @@ export function fqdnForName(name: string): string {
   return `${name}.${DOMAIN_SUFFIX}`;
 }
 
+// The tunnel relay's namespace: <name>.tinycloud.link (the public apex zone,
+// not the LAN-only local.tinycloud.link zone above). A name claimed via
+// PUT /v1/names/:name is the same name a subject can open a tunnel for --
+// there is one name registry, two surfaces (LAN A/AAAA records vs. a remote
+// WebSocket tunnel).
+export const REMOTE_DOMAIN_SUFFIX = "tinycloud.link";
+
+export function remoteFqdnForName(name: string): string {
+  return `${name}.${REMOTE_DOMAIN_SUFFIX}`;
+}
+
 const NAME_LABEL_PATTERN = /^[a-z0-9]([a-z0-9-]{1,30}[a-z0-9])?$/;
 
 // Reserved so a claimed name can never collide with infrastructure, the
@@ -207,6 +218,61 @@ export function validateNameDelete(input: unknown): NameDeleteRecord {
 
 export async function verifyNameDelete(record: NameDeleteRecord): Promise<boolean> {
   return verifySignedPayload(record.subject, canonicalDeletePayload(record), record.signature);
+}
+
+// --- tunnel registration (first frame sent over wss://.../v1/tunnel/:name) ---
+//
+// Same signed-payload scheme as claim/delete/cert above: the node proves it
+// owns `name` (already claimed via PUT /v1/names/:name) with a signature
+// over a canonical payload and a strictly-increasing sequence, reusing the
+// name record's own sequence counter for replay protection.
+
+export interface TunnelAuthPayload {
+  version: 1;
+  action: "tunnel";
+  name: string;
+  subject: string;
+  sequence: number;
+}
+
+export interface TunnelAuthRecord extends TunnelAuthPayload {
+  signature: string;
+}
+
+export function canonicalTunnelAuthPayload(payload: TunnelAuthPayload): string {
+  return JSON.stringify({
+    version: payload.version,
+    action: payload.action,
+    name: payload.name,
+    subject: payload.subject,
+    sequence: payload.sequence,
+  });
+}
+
+export function validateTunnelAuth(input: unknown): TunnelAuthRecord {
+  if (input === null || typeof input !== "object") {
+    throw new NameError("body must be an object");
+  }
+  const body = input as Partial<TunnelAuthRecord>;
+  if (body.version !== 1) {
+    throw new NameError("version must be 1");
+  }
+  if (body.action !== "tunnel") {
+    throw new NameError('action must be "tunnel"');
+  }
+
+  return {
+    version: 1,
+    action: "tunnel",
+    name: validateNameLabel(body.name),
+    subject: validateSubject(body.subject),
+    sequence: validateSequence(body.sequence),
+    signature: validateSignature(body.signature),
+  };
+}
+
+export async function verifyTunnelAuth(record: TunnelAuthRecord): Promise<boolean> {
+  return verifySignedPayload(record.subject, canonicalTunnelAuthPayload(record), record.signature);
 }
 
 // --- cert request (POST /v1/certs/:name) ---

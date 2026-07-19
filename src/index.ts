@@ -4,6 +4,9 @@ import { DnsO1AcmeIssuer } from "./acme.js";
 import { CloudflareDnsProvider } from "./dns/cloudflare.js";
 import { PostgresAcmeAccountStore, PostgresCertRateLimiter, PostgresNameStore } from "./postgres.js";
 import { createServer } from "./server.js";
+import { DEFAULT_API_HOSTNAME } from "./tunnel/host-router.js";
+import { TunnelRegistry } from "./tunnel/registry.js";
+import { attachTunnelUpgrade } from "./tunnel/upgrade.js";
 
 const port = Number.parseInt(process.env.PORT ?? "3000", 10);
 const databaseUrl = process.env.DATABASE_URL;
@@ -45,15 +48,21 @@ const acmeIssuer = new DnsO1AcmeIssuer({
   dnsProvider,
 });
 
+const tunnelRegistry = new TunnelRegistry();
+const apiHostname = process.env.API_HOSTNAME ?? DEFAULT_API_HOSTNAME;
+
 const app = createServer({
   nameStore,
   dnsProvider,
   acmeIssuer,
   rateLimiter,
   attestationDocument: process.env.ATTESTATION_DOCUMENT,
+  tunnelRegistry,
+  apiHostname,
 });
 
-serve({ fetch: app.fetch, port });
+const server = serve({ fetch: app.fetch, port });
+attachTunnelUpgrade(server, { registry: tunnelRegistry, nameStore });
 console.log(`tinycloud-link listening on :${port}`);
 
 const shutdown = async () => {

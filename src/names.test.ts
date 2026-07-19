@@ -6,14 +6,17 @@ import {
   canonicalCertRequestPayload,
   canonicalClaimPayload,
   canonicalDeletePayload,
+  canonicalTunnelAuthPayload,
   fqdnForName,
   validateCertRequest,
   validateNameClaim,
   validateNameDelete,
   validateNameLabel,
+  validateTunnelAuth,
   verifyCertRequest,
   verifyNameClaim,
   verifyNameDelete,
+  verifyTunnelAuth,
 } from "./names.js";
 import { createTestCsr, createTestEcCsr } from "./test-support/csr.js";
 import { didKeySigner, pkhSigner } from "./test-support/signing.js";
@@ -239,6 +242,53 @@ test("validates and verifies a name delete record", async () => {
 
   assert.deepEqual(validateNameDelete(record), record);
   assert.equal(await verifyNameDelete(record), true);
+});
+
+test("validates and verifies a tunnel auth record", async () => {
+  const signer = didKeySigner(40);
+  const unsigned = {
+    version: 1 as const,
+    action: "tunnel" as const,
+    name: "tunnelnode",
+    subject: signer.subject,
+    sequence: 2,
+  };
+  const signature = await signer.sign(canonicalTunnelAuthPayload(unsigned));
+  const record = { ...unsigned, signature };
+
+  assert.deepEqual(validateTunnelAuth(record), record);
+  assert.equal(await verifyTunnelAuth(record), true);
+});
+
+test("rejects a tunnel auth record signed by the wrong key", async () => {
+  const signer = didKeySigner(41);
+  const other = didKeySigner(42);
+  const unsigned = {
+    version: 1 as const,
+    action: "tunnel" as const,
+    name: "tunnelnode",
+    subject: signer.subject,
+    sequence: 2,
+  };
+  const signature = await other.sign(canonicalTunnelAuthPayload(unsigned));
+  const record = { ...unsigned, signature };
+
+  assert.equal(await verifyTunnelAuth(record), false);
+});
+
+test("rejects a tunnel auth record with the wrong action", () => {
+  assert.throws(
+    () =>
+      validateTunnelAuth({
+        version: 1,
+        action: "claim",
+        name: "tunnelnode",
+        subject: didKeySigner(43).subject,
+        sequence: 1,
+        signature: "x",
+      }),
+    NameError
+  );
 });
 
 test("validates and verifies a cert request record", async () => {
