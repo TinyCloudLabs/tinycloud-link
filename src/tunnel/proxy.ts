@@ -1,24 +1,27 @@
 import { randomUUID } from "node:crypto";
 import type WebSocket from "ws";
-import { encodeFrame, parseFrame } from "./protocol.js";
+import { BODY_CHUNK_BYTES, DEFAULT_MAX_BODY_BYTES, encodeFrame, parseFrame } from "./protocol.js";
 import { rawDataToString } from "./ws-util.js";
 
 export interface TunnelProxyRequest {
   method: string;
   /** Path + query string, e.g. "/foo?bar=1". */
   path: string;
-  headers: Record<string, string>;
+  /** Ordered [name, value] pairs (see protocol.ts) so duplicate header names survive. */
+  headers: Array<[string, string]>;
   body: Uint8Array;
 }
 
 export interface TunnelProxyResponse {
   status: number;
-  headers: Record<string, string>;
+  /** Ordered [name, value] pairs (see protocol.ts) so duplicate header names, e.g. Set-Cookie, survive. */
+  headers: Array<[string, string]>;
   body: Uint8Array;
 }
 
 export class TunnelProxyError extends Error {}
 export class TunnelProxyTimeoutError extends TunnelProxyError {}
+export class TunnelProxyBodyTooLargeError extends TunnelProxyError {}
 
 const DEFAULT_TIMEOUT_MS = 30_000;
 
@@ -32,15 +35,17 @@ const DEFAULT_TIMEOUT_MS = 30_000;
 export function proxyRequest(
   socket: WebSocket,
   request: TunnelProxyRequest,
-  opts: { timeoutMs?: number } = {}
+  opts: { timeoutMs?: number; maxResponseBytes?: number } = {}
 ): Promise<TunnelProxyResponse> {
   const id = randomUUID();
   const timeoutMs = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+  const maxResponseBytes = opts.maxResponseBytes ?? DEFAULT_MAX_BODY_BYTES;
 
   return new Promise<TunnelProxyResponse>((resolve, reject) => {
     let status: number | undefined;
-    let headers: Record<string, string> | undefined;
+    let headers: Array<[string, string]> | undefined;
     const bodyChunks: Buffer[] = [];
+    let bodyBytes = 0;
     let settled = false;
 
     const cleanup = () => {
@@ -79,7 +84,16 @@ export function proxyRequest(
       }
       if (frame.type === "responseBody" && frame.id === id) {
         if (frame.chunk.length > 0) {
-          bodyChunks.push(Buffer.from(frame.chunk, "base64"));
+          const chunk = Buffer.from(frame.chunk, "base64");
+          bodyBytes += chunk.length;
+          if (bodyBytes > maxResponseBytes) {
+            socket.send(
+              encodeFrame({ type: "error", id, message: `response body exceeds ${maxResponseBytes} byte limit` })
+            );
+            fail(new TunnelProxyBodyTooLargeError(`response body for request ${id} exceeded ${maxResponseBytes} bytes`));
+            return;
+          }
+          bodyChunks.push(chunk);
         }
         if (frame.done) {
           if (status === undefined || headers === undefined) {
@@ -102,13 +116,25 @@ export function proxyRequest(
     socket.send(
       encodeFrame({ type: "request", id, method: request.method, path: request.path, headers: request.headers })
     );
-    socket.send(
-      encodeFrame({
-        type: "requestBody",
-        id,
-        chunk: Buffer.from(request.body).toString("base64"),
-        done: true,
-      })
-    );
+
+    // Split the body across multiple requestBody frames of at most
+    // BODY_CHUNK_BYTES each so no single WS message risks tripping the
+    // relay's/node's WebSocketServer maxPayload (see protocol.ts). An empty
+    // body still sends exactly one frame, done: true.
+    const body = Buffer.from(request.body);
+    let offset = 0;
+    do {
+      const end = Math.min(offset + BODY_CHUNK_BYTES, body.length);
+      const done = end >= body.length;
+      socket.send(
+        encodeFrame({
+          type: "requestBody",
+          id,
+          chunk: body.subarray(offset, end).toString("base64"),
+          done,
+        })
+      );
+      offset = end;
+    } while (offset < body.length);
   });
 }

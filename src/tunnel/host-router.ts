@@ -1,9 +1,49 @@
 import type { Context, MiddlewareHandler } from "hono";
 import { REMOTE_DOMAIN_SUFFIX } from "../names.js";
+import { DEFAULT_MAX_BODY_BYTES } from "./protocol.js";
 import { TunnelProxyError, TunnelProxyTimeoutError, proxyRequest } from "./proxy.js";
 import type { TunnelRegistry } from "./registry.js";
 
 export const DEFAULT_API_HOSTNAME = "api.tinycloud.link";
+
+class RequestBodyTooLargeError extends Error {}
+
+/**
+ * Reads a Request body while enforcing `maxBytes`, without ever buffering
+ * more than the limit in memory: a Content-Length over the cap is rejected
+ * without reading the stream at all, and a chunked/unsized body is read
+ * incrementally and aborted the moment the running total crosses the cap.
+ */
+async function readLimitedBody(request: Request, maxBytes: number): Promise<Uint8Array> {
+  if (!request.body) return new Uint8Array(0);
+
+  const contentLength = request.headers.get("content-length");
+  if (contentLength !== null && Number(contentLength) > maxBytes) {
+    throw new RequestBodyTooLargeError();
+  }
+
+  const reader = request.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    total += value.length;
+    if (total > maxBytes) {
+      await reader.cancel();
+      throw new RequestBodyTooLargeError();
+    }
+    chunks.push(value);
+  }
+
+  const body = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    body.set(chunk, offset);
+    offset += chunk.length;
+  }
+  return body;
+}
 
 /**
  * Resolves an inbound Host header to a tunnel name, or null if this request
@@ -38,8 +78,10 @@ const HOP_BY_HOP_HEADERS = new Set(["connection", "keep-alive", "transfer-encodi
  */
 export function createTunnelMiddleware(
   registry: TunnelRegistry,
-  opts: { apiHostname: string }
+  opts: { apiHostname: string; maxBodyBytes?: number }
 ): MiddlewareHandler {
+  const maxBodyBytes = opts.maxBodyBytes ?? DEFAULT_MAX_BODY_BYTES;
+
   return async (c: Context, next) => {
     const name = remoteNameFromHost(c.req.header("host"), opts.apiHostname);
     if (!name) {
@@ -52,26 +94,43 @@ export function createTunnelMiddleware(
       return c.json({ error: `no active tunnel for "${name}"` }, 502);
     }
 
-    const headers: Record<string, string> = {};
+    const headers: Array<[string, string]> = [];
     c.req.raw.headers.forEach((value, key) => {
       if (!HOP_BY_HOP_HEADERS.has(key.toLowerCase())) {
-        headers[key] = value;
+        headers.push([key, value]);
       }
     });
 
     const url = new URL(c.req.url);
-    const body = new Uint8Array(await c.req.raw.arrayBuffer());
+
+    let body: Uint8Array;
+    try {
+      body = await readLimitedBody(c.req.raw, maxBodyBytes);
+    } catch (error) {
+      if (error instanceof RequestBodyTooLargeError) {
+        return c.json({ error: `request body exceeds ${maxBodyBytes} byte limit` }, 413);
+      }
+      throw error;
+    }
 
     try {
-      const response = await proxyRequest(socket, {
-        method: c.req.method,
-        path: `${url.pathname}${url.search}`,
-        headers,
-        body,
-      });
+      const response = await proxyRequest(
+        socket,
+        {
+          method: c.req.method,
+          path: `${url.pathname}${url.search}`,
+          headers,
+          body,
+        },
+        { maxResponseBytes: maxBodyBytes }
+      );
+      const responseHeaders = new Headers();
+      for (const [key, value] of response.headers) {
+        responseHeaders.append(key, value);
+      }
       return new Response(new Uint8Array(response.body), {
         status: response.status,
-        headers: response.headers,
+        headers: responseHeaders,
       });
     } catch (error) {
       if (error instanceof TunnelProxyTimeoutError) {

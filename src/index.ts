@@ -15,6 +15,12 @@ const cloudflareZoneId = process.env.CLOUDFLARE_ZONE_ID;
 const acmeEmail = process.env.ACME_EMAIL;
 const acmeDirectory =
   process.env.ACME_DIRECTORY ?? "https://acme-staging-v02.api.letsencrypt.org/directory";
+const tunnelMaxBodyBytes = process.env.TUNNEL_MAX_BODY_BYTES
+  ? Number.parseInt(process.env.TUNNEL_MAX_BODY_BYTES, 10)
+  : undefined;
+const tunnelMaxConcurrent = process.env.TUNNEL_MAX_CONCURRENT
+  ? Number.parseInt(process.env.TUNNEL_MAX_CONCURRENT, 10)
+  : undefined;
 
 if (!databaseUrl) throw new Error("DATABASE_URL is required");
 if (!cloudflareApiToken) throw new Error("CLOUDFLARE_API_TOKEN is required");
@@ -59,10 +65,15 @@ const app = createServer({
   attestationDocument: process.env.ATTESTATION_DOCUMENT,
   tunnelRegistry,
   apiHostname,
+  tunnelMaxBodyBytes,
 });
 
 const server = serve({ fetch: app.fetch, port });
-attachTunnelUpgrade(server, { registry: tunnelRegistry, nameStore });
+attachTunnelUpgrade(server, {
+  registry: tunnelRegistry,
+  nameStore,
+  maxConcurrentTunnels: tunnelMaxConcurrent,
+});
 console.log(`tinycloud-link listening on :${port}`);
 
 const shutdown = async () => {

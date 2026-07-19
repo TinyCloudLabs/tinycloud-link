@@ -31,6 +31,8 @@ export interface ServerConfig {
   tunnelRegistry?: TunnelRegistry;
   /** The control-plane API's own hostname, exempted from tunnel routing. Defaults to "api.tinycloud.link". */
   apiHostname?: string;
+  /** Max bytes accepted for a proxied tunnel request body. Defaults to protocol.ts's DEFAULT_MAX_BODY_BYTES (25MB); overridable via the TUNNEL_MAX_BODY_BYTES env var (see index.ts). */
+  tunnelMaxBodyBytes?: number;
 }
 
 // Prefixes name-update entries so they share the cert rate-limit store without
@@ -49,6 +51,7 @@ export function createServer(config: ServerConfig): Hono {
       "*",
       createTunnelMiddleware(config.tunnelRegistry, {
         apiHostname: config.apiHostname ?? DEFAULT_API_HOSTNAME,
+        maxBodyBytes: config.tunnelMaxBodyBytes,
       })
     );
   }

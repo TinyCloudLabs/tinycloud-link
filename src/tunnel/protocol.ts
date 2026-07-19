@@ -12,8 +12,30 @@
  *
  * This file is the source of truth for a Rust client implementation --
  * every frame shape a node must produce or consume is defined here.
+ *
+ * Size limits (see README's "Remote reachability: the tunnel relay" section
+ * for the full contract): the relay's WebSocketServer enforces
+ * `MAX_FRAME_PAYLOAD_BYTES` on every inbound WS message (src/tunnel/upgrade.ts),
+ * so no single frame -- request or response -- may serialize to more than
+ * that many bytes. A body larger than `BODY_CHUNK_BYTES` must be split across
+ * multiple `requestBody`/`responseBody` frames (only the last carries
+ * `done: true`); `BODY_CHUNK_BYTES` is sized so a base64-encoded chunk plus
+ * its JSON envelope always stays well under `MAX_FRAME_PAYLOAD_BYTES`.
+ * `DEFAULT_MAX_BODY_BYTES` bounds the total (reassembled) size of a request
+ * or response body; a node must not send, and the relay will not forward, a
+ * body larger than this (configurable via `TUNNEL_MAX_BODY_BYTES` on the
+ * relay -- see README).
  */
 import type { TunnelAuthRecord } from "../names.js";
+
+/** Max size in bytes of a single WebSocket message the relay will accept from a node (see src/tunnel/upgrade.ts's WebSocketServer maxPayload). */
+export const MAX_FRAME_PAYLOAD_BYTES = 1 * 1024 * 1024;
+
+/** Chunk size (pre-base64, in bytes) used to split a request/response body across multiple body frames. Base64 expands this by ~4/3, plus JSON envelope overhead, staying comfortably under MAX_FRAME_PAYLOAD_BYTES. */
+export const BODY_CHUNK_BYTES = 256 * 1024;
+
+/** Default cap (bytes) on a full reassembled request or response body; overridable via the TUNNEL_MAX_BODY_BYTES env var. */
+export const DEFAULT_MAX_BODY_BYTES = 25 * 1024 * 1024;
 
 /** First message a node sends after the WebSocket opens. */
 export type TunnelAuthFrame = TunnelAuthRecord & { type?: undefined };
@@ -40,10 +62,11 @@ export interface TunnelRequestFrame {
   method: string;
   /** Path + query string, e.g. "/foo?bar=1". Always starts with "/". */
   path: string;
-  headers: Record<string, string>;
+  /** Ordered [name, value] pairs, one per header line -- an array (not an object) so duplicate header names (e.g. multiple Cookie lines) survive rather than colliding on one object key. */
+  headers: Array<[string, string]>;
 }
 
-/** Relay -> node: a chunk of the request body. Always sent at least once per request, even if empty. */
+/** Relay -> node: a chunk of the request body. Always sent at least once per request, even if empty. A body larger than BODY_CHUNK_BYTES is split across multiple requestBody frames; only the last has done: true. */
 export interface TunnelRequestBodyFrame {
   type: "requestBody";
   id: string;
@@ -57,10 +80,11 @@ export interface TunnelResponseFrame {
   type: "response";
   id: string;
   status: number;
-  headers: Record<string, string>;
+  /** Ordered [name, value] pairs -- an array (not an object) so duplicate header names, most importantly Set-Cookie, survive rather than colliding on one object key. */
+  headers: Array<[string, string]>;
 }
 
-/** Node -> relay: a chunk of the response body. Always sent at least once per request, even if empty. */
+/** Node -> relay: a chunk of the response body. Always sent at least once per request, even if empty. A body larger than BODY_CHUNK_BYTES should be split across multiple responseBody frames; only the last has done: true. */
 export interface TunnelResponseBodyFrame {
   type: "responseBody";
   id: string;
