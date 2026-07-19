@@ -15,7 +15,7 @@ import {
   verifyNameClaim,
   verifyNameDelete,
 } from "./names.js";
-import { createTestCsr } from "./test-support/csr.js";
+import { createTestCsr, createTestEcCsr } from "./test-support/csr.js";
 import { didKeySigner, pkhSigner } from "./test-support/signing.js";
 
 test("validates and verifies a did:key name claim", async () => {
@@ -282,4 +282,16 @@ test("csr domain check rejects a csr with a non-dNSName SAN entry", () => {
   const domain = fqdnForName("mynode");
   const csr = createTestCsr(domain, [domain, { type: 7, ip: "8.8.8.8" }]); // iPAddress
   assert.throws(() => assertCsrMatchesDomain(csr, domain), /only a dNSName entry/);
+});
+
+test("csr domain check accepts an ECDSA P-256 CSR with an exact CN/SAN match", async () => {
+  const domain = fqdnForName("ecnode");
+  const csr = await createTestEcCsr(domain);
+  assert.doesNotThrow(() => assertCsrMatchesDomain(csr, domain));
+});
+
+test("csr domain check rejects an ECDSA P-256 CSR with a mismatched domain", async () => {
+  const domain = fqdnForName("ecnode");
+  const csr = await createTestEcCsr(domain);
+  assert.throws(() => assertCsrMatchesDomain(csr, fqdnForName("otherecnode")), NameError);
 });

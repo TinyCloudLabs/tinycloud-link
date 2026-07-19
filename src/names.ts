@@ -1,4 +1,4 @@
-import forge from "node-forge";
+import * as x509 from "@peculiar/x509";
 import { isPrivateAddress } from "./ip.js";
 import { isSupportedSubject, verifySignedPayload } from "./crypto-verify.js";
 
@@ -265,30 +265,35 @@ export async function verifyCertRequest(record: CertRequestRecord): Promise<bool
   return verifySignedPayload(record.subject, canonicalCertRequestPayload(record), record.signature);
 }
 
+// OID for the subjectAltName X.509 extension (RFC 5280).
+const SUBJECT_ALT_NAME_OID = "2.5.29.17";
+
 /**
  * Enforces that the CSR's CN and its complete SAN set is exactly the
  * expected <name>.local.tinycloud.link domain as a single dNSName entry --
  * nothing broader, nothing else, no SAN entries of any other type.
+ *
+ * Parses with @peculiar/x509 (not node-forge): forge cannot parse CSRs with
+ * an EC (e.g. ECDSA P-256) public key at all ("OID is not RSA"), which would
+ * reject every ECDSA node CSR outright regardless of its CN/SAN. @peculiar/x509
+ * parses the CSR's subject and extensions independently of the key algorithm,
+ * so RSA and ECDSA CSRs are validated identically.
  */
 export function assertCsrMatchesDomain(csrPem: string, expectedDomain: string): void {
-  let csr: forge.pki.CertificateSigningRequest;
+  let csr: x509.Pkcs10CertificateRequest;
   try {
-    csr = forge.pki.certificationRequestFromPem(csrPem);
+    csr = new x509.Pkcs10CertificateRequest(csrPem);
   } catch {
     throw new NameError("csr must be a valid PEM-encoded PKCS#10 certificate request");
   }
 
-  const cnField = csr.subject.getField("CN");
-  const cn = cnField ? cnField.value : undefined;
+  const cn = csr.subjectName.getField("CN")[0];
 
-  const extensionRequest = csr.getAttribute({ name: "extensionRequest" });
-  const sanExtension = (extensionRequest?.extensions ?? []).find(
-    (ext: { name?: string }) => ext.name === "subjectAltName"
-  ) as { altNames?: Array<{ type: number; value: string }> } | undefined;
-  const altNames = sanExtension?.altNames ?? [];
+  const sanExtension = csr.extensions.find((ext) => ext.type === SUBJECT_ALT_NAME_OID);
+  const altNames =
+    sanExtension instanceof x509.SubjectAlternativeNameExtension ? sanExtension.names.items : [];
   for (const entry of altNames) {
-    if (entry.type !== 2) {
-      // 2 = dNSName
+    if (entry.type !== "dns") {
       throw new NameError(
         `csr subjectAltName must contain only a dNSName entry for ${expectedDomain} (found an entry of type ${entry.type})`
       );

@@ -1,5 +1,8 @@
-import forge from "node-forge";
+import { webcrypto } from "node:crypto";
+import * as x509 from "@peculiar/x509";
 import type { AcmeAuthorization, AcmeChallenge, AcmeClientLike, AcmeOrder } from "../acme.js";
+
+x509.cryptoProvider.set(webcrypto as unknown as Crypto);
 
 /**
  * In-process fake of acme-client's Client. Stands in for a real ACME
@@ -7,11 +10,18 @@ import type { AcmeAuthorization, AcmeChallenge, AcmeClientLike, AcmeOrder } from
  * completeChallenge -> finalizeOrder -> getCertificate flow as
  * DnsO1AcmeIssuer expects, and issues a self-signed leaf certificate for the
  * CSR's public key once challenges are "completed". No network calls.
+ *
+ * Uses @peculiar/x509 (not node-forge) so it can parse and sign CSRs for
+ * either RSA or ECDSA node keys -- forge cannot parse an EC CSR at all.
  */
 export class FakeAcmeClient implements AcmeClientLike {
   readonly completedChallenges: AcmeChallenge[] = [];
   private lastCsr: string | Buffer | undefined;
-  private readonly caKeys = forge.pki.rsa.generateKeyPair(1024);
+  private caKeysPromise = webcrypto.subtle.generateKey(
+    { name: "ECDSA", namedCurve: "P-256" },
+    true,
+    ["sign", "verify"]
+  );
 
   async createAccount(): Promise<unknown> {
     return { status: "valid" };
@@ -63,17 +73,20 @@ export class FakeAcmeClient implements AcmeClientLike {
     if (!this.lastCsr) {
       throw new Error("finalizeOrder must be called before getCertificate");
     }
-    const csr = forge.pki.certificationRequestFromPem(this.lastCsr.toString());
+    const csr = new x509.Pkcs10CertificateRequest(this.lastCsr.toString());
+    const caKeys = await this.caKeysPromise;
 
-    const cert = forge.pki.createCertificate();
-    cert.publicKey = csr.publicKey!;
-    cert.serialNumber = "01";
-    cert.validity.notBefore = new Date();
-    cert.validity.notAfter = new Date(Date.now() + 90 * 24 * 60 * 60 * 1000);
-    cert.setSubject(csr.subject.attributes);
-    cert.setIssuer([{ name: "commonName", value: "Fake Test CA" }]);
-    cert.sign(this.caKeys.privateKey, forge.md.sha256.create());
+    const cert = await x509.X509CertificateGenerator.create({
+      serialNumber: "01",
+      subject: csr.subjectName,
+      issuer: "CN=Fake Test CA",
+      notBefore: new Date(),
+      notAfter: new Date(Date.now() + 90 * 24 * 60 * 60 * 1000),
+      signingAlgorithm: { name: "ECDSA", hash: "SHA-256" },
+      publicKey: csr.publicKey,
+      signingKey: caKeys.privateKey,
+    });
 
-    return forge.pki.certificateToPem(cert);
+    return cert.toString("pem");
   }
 }
