@@ -97,8 +97,9 @@ Public, unsigned. Returns `{ name, subject, lanIps, updatedAt }` or `404`.
 ```
 
 - Verifies the requester owns `name` and the signature is valid.
-- The CSR's CN and every SAN entry must be **exactly** `<name>.local.tinycloud.link` -- no wildcards, no extra names.
+- The CSR's CN and every SAN entry must be **exactly** `<name>.local.tinycloud.link` -- no wildcards, no extra names. The CSR's key may be RSA or ECDSA (P-256); both are validated identically (`src/names.ts`'s `assertCsrMatchesDomain` parses with `@peculiar/x509`, not node-forge, specifically so ECDSA node keys aren't rejected).
 - Rate-limited to 5 issuances/day per name to protect Let's Encrypt's rate limits.
+- **Sequence is bumped before the ACME round trip, not after.** Once the request passes ownership/signature/CSR checks, the handler immediately persists the new `sequence` on the name record and only then calls the ACME issuer. This is deliberate: an ACME DNS-01 order is slow (DNS propagation + CA validation, seconds to tens of seconds) and not idempotent to retry blindly, so the sequence bump has to happen *before* it, not after it succeeds. That way a replayed or concurrent request carrying the same (now-stale) sequence number is rejected with `409` immediately instead of racing a second ACME order for the same name while the first is still in flight. The tradeoff: if the ACME call itself fails after the bump (rate limit, DNS-01 timeout, CA outage), the sequence has still moved forward and the node must retry with a strictly higher sequence, not the same one -- there is no "undo" of the bump on failure.
 - Opens an ACME order against `ACME_DIRECTORY` (Let's Encrypt staging by default), completes it via DNS-01 through the configured `DnsProvider`, finalizes with the node's CSR, and returns `{ certChainPem, notAfter }`.
 - The private key backing the CSR is generated and held by the node. It is never transmitted to or stored by this service.
 
