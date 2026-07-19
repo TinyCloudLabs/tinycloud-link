@@ -111,6 +111,8 @@ Public, unsigned. Returns `{ name, subject, lanIps, updatedAt }` or `404`.
 
 There is one name registry with two surfaces: a name claimed via `PUT /v1/names/:name` gets LAN A/AAAA records (`<name>.local.tinycloud.link`) *and* the right to open a tunnel for `<name>.tinycloud.link`. Same owner, same signing key, same sequence counter.
 
+**Sequence coordination is per-name, not per-operation**: `claim`/`delete` (`PUT`/`DELETE /v1/names/:name`), `cert` (`POST /v1/certs/:name`), and `tunnel` (the WS auth frame) all read and bump the *same* `sequence` column on the name's row in `names`. There is exactly one counter per name, shared across every action type -- a node must treat it as a single source of truth (e.g. keep one in-memory counter per name and increment it before every signed write, regardless of which endpoint), not maintain a separate counter per action. Reusing a sequence across two different action types for the same name is exactly as stale/rejected as reusing it for the same action twice.
+
 ### Lifecycle
 
 ```
@@ -144,6 +146,7 @@ There is one name registry with two surfaces: a name claimed via `PUT /v1/names/
 - **Close codes on rejection** (RFC 6455 private-use range): `4400` malformed auth frame or frame `name` != URL name, `4401` invalid signature, `4403` subject does not own the name, `4404` name not claimed, `4408` auth timeout, `4409` stale sequence, `4410` superseded by a newer connection for the same name.
 - **One socket per name, newest wins** (`src/tunnel/registry.ts`): a second authenticated connection for the same name evicts the first (close `4410`) rather than being rejected -- a node reconnecting after a network blip must be able to take over from its own half-dead previous socket. (Each reconnect needs a fresh auth frame with a higher sequence.)
 - **Keep-alive**: the relay pings every 30s and terminates the socket if the previous ping got no pong. Standard WS libraries answer pings automatically; a Rust client must confirm its library does (tungstenite does).
+- **Connection-attempt limits** (`src/tunnel/upgrade.ts`, checked in the raw HTTP `upgrade` handler, before the WS handshake and before any Postgres read): at most 30 upgrade attempts per remote IP per minute, at most 10 upgrade attempts per tunnel name per minute (bounds reconnect/eviction churn on one name), and a global cap of 1000 concurrently registered tunnels (env-tunable via `TUNNEL_MAX_CONCURRENT`, see below). An attempt over any of these limits gets the raw TCP socket destroyed -- no WS handshake, no close code, nothing for the node to parse.
 
 ### Frame protocol
 
@@ -151,17 +154,18 @@ Defined in `src/tunnel/protocol.ts` -- that file is the source of truth for the 
 
 | frame | direction | fields |
 |---|---|---|
-| `request` | relay → node | `id` (UUID string), `method`, `path` (path + query, always starts with `/`), `headers` (string map; `Host` and hop-by-hop headers stripped) |
+| `request` | relay → node | `id` (UUID string), `method`, `path` (path + query, always starts with `/`), `headers` (ordered `[name, value]` pairs; `Host` and hop-by-hop headers stripped) |
 | `requestBody` | relay → node | `id`, `chunk` (base64, may be `""`), `done` (bool) |
-| `response` | node → relay | `id`, `status` (int), `headers` (string map) |
+| `response` | node → relay | `id`, `status` (int), `headers` (ordered `[name, value]` pairs) |
 | `responseBody` | node → relay | `id`, `chunk` (base64, may be `""`), `done` (bool) |
 | `error` | either direction | `message`, optional `id` (fails just that request without closing the socket) |
 
 Rules a node client must follow:
 
-- Requests are multiplexed: frames for different `id`s interleave freely on the one socket. Echo the request's `id` on every frame you send for it.
-- The relay sends `request` first, then at least one `requestBody` (currently exactly one carrying the whole body with `done: true`, but a client must tolerate multiple chunks and treat `done: true` as the boundary).
-- The node replies with exactly one `response` frame, then one or more `responseBody` frames ending with `done: true`. An empty body is still one frame: `{"type":"responseBody","id":...,"chunk":"","done":true}`.
+- Requests are multiplexed: frames for different `id`s interleave freely on the one socket. Echo the request's `id` on every frame you send for it. A frame carrying an `id` the relay/node doesn't recognize (e.g. arriving after that request already failed or timed out) is silently ignored, never treated as a protocol error.
+- **Headers are ordered `[name, value]` pairs, not an object** -- so a header repeated on the wire (most importantly `Set-Cookie`, but any header) survives as multiple array entries instead of colliding on one object key. A client must be able to both emit and parse duplicate entries for the same header name.
+- The relay sends `request` first, then one or more `requestBody` frames ending with `done: true`; the node replies with exactly one `response` frame, then one or more `responseBody` frames ending with `done: true`. An empty body is still exactly one frame: `{"...Body","id":...,"chunk":"","done":true}`.
+- **Size limits**: no single WS frame may exceed `MAX_FRAME_PAYLOAD_BYTES` (1MB) -- the relay's `WebSocketServer` is configured with this as `maxPayload` and will close a connection that sends a larger one (WS close code `1009`). A body larger than `BODY_CHUNK_BYTES` (256KB, chosen to stay well under 1MB once base64-inflated) must be split across multiple body frames; only the last carries `done: true`. The relay itself follows this when sending `requestBody` frames and expects a node to do the same for `responseBody`. Independent of frame size, the full reassembled body (request or response) is capped at `DEFAULT_MAX_BODY_BYTES` (25MB, overridable via the `TUNNEL_MAX_BODY_BYTES` env var, see below): a request over the cap gets `413` directly from the relay before it ever reaches the tunnel; a response over the cap is aborted with `502` to the HTTP caller and an `{"type":"error","id":...}` frame is sent back to the node so it knows to stop sending.
 - If the node cannot serve a request it sends `{"type":"error","id":...,"message":...}`; the relay answers the HTTP caller with `502`. The relay applies a 30s per-request timeout (caller gets `504`).
 - HTTP callers with no live tunnel for their Host get `502` directly from the relay.
 
