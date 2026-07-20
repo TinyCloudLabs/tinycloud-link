@@ -6,16 +6,19 @@ import {
   canonicalCertRequestPayload,
   canonicalClaimPayload,
   canonicalDeletePayload,
+  canonicalTunnelAuthPayload,
   fqdnForName,
   validateCertRequest,
   validateNameClaim,
   validateNameDelete,
   validateNameLabel,
+  validateTunnelAuth,
   verifyCertRequest,
   verifyNameClaim,
   verifyNameDelete,
+  verifyTunnelAuth,
 } from "./names.js";
-import { createTestCsr } from "./test-support/csr.js";
+import { createTestCsr, createTestEcCsr } from "./test-support/csr.js";
 import { didKeySigner, pkhSigner } from "./test-support/signing.js";
 
 test("validates and verifies a did:key name claim", async () => {
@@ -241,6 +244,53 @@ test("validates and verifies a name delete record", async () => {
   assert.equal(await verifyNameDelete(record), true);
 });
 
+test("validates and verifies a tunnel auth record", async () => {
+  const signer = didKeySigner(40);
+  const unsigned = {
+    version: 1 as const,
+    action: "tunnel" as const,
+    name: "tunnelnode",
+    subject: signer.subject,
+    sequence: 2,
+  };
+  const signature = await signer.sign(canonicalTunnelAuthPayload(unsigned));
+  const record = { ...unsigned, signature };
+
+  assert.deepEqual(validateTunnelAuth(record), record);
+  assert.equal(await verifyTunnelAuth(record), true);
+});
+
+test("rejects a tunnel auth record signed by the wrong key", async () => {
+  const signer = didKeySigner(41);
+  const other = didKeySigner(42);
+  const unsigned = {
+    version: 1 as const,
+    action: "tunnel" as const,
+    name: "tunnelnode",
+    subject: signer.subject,
+    sequence: 2,
+  };
+  const signature = await other.sign(canonicalTunnelAuthPayload(unsigned));
+  const record = { ...unsigned, signature };
+
+  assert.equal(await verifyTunnelAuth(record), false);
+});
+
+test("rejects a tunnel auth record with the wrong action", () => {
+  assert.throws(
+    () =>
+      validateTunnelAuth({
+        version: 1,
+        action: "claim",
+        name: "tunnelnode",
+        subject: didKeySigner(43).subject,
+        sequence: 1,
+        signature: "x",
+      }),
+    NameError
+  );
+});
+
 test("validates and verifies a cert request record", async () => {
   const signer = didKeySigner(13);
   const domain = fqdnForName("certnode");
@@ -282,4 +332,16 @@ test("csr domain check rejects a csr with a non-dNSName SAN entry", () => {
   const domain = fqdnForName("mynode");
   const csr = createTestCsr(domain, [domain, { type: 7, ip: "8.8.8.8" }]); // iPAddress
   assert.throws(() => assertCsrMatchesDomain(csr, domain), /only a dNSName entry/);
+});
+
+test("csr domain check accepts an ECDSA P-256 CSR with an exact CN/SAN match", async () => {
+  const domain = fqdnForName("ecnode");
+  const csr = await createTestEcCsr(domain);
+  assert.doesNotThrow(() => assertCsrMatchesDomain(csr, domain));
+});
+
+test("csr domain check rejects an ECDSA P-256 CSR with a mismatched domain", async () => {
+  const domain = fqdnForName("ecnode");
+  const csr = await createTestEcCsr(domain);
+  assert.throws(() => assertCsrMatchesDomain(csr, fqdnForName("otherecnode")), NameError);
 });

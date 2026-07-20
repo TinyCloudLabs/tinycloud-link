@@ -14,6 +14,8 @@ import {
   verifyNameDelete,
 } from "./names.js";
 import type { CertRateLimiter, NameStore } from "./storage.js";
+import { DEFAULT_API_HOSTNAME, createTunnelMiddleware } from "./tunnel/host-router.js";
+import type { TunnelRegistry } from "./tunnel/registry.js";
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 
@@ -25,6 +27,12 @@ export interface ServerConfig {
   attestationDocument?: string;
   certRateLimitPerDay?: number;
   nameUpdateRateLimitPerDay?: number;
+  /** When set, requests whose Host header names a claimed tunnel (rather than `apiHostname`) are proxied through it. Omit to leave tunnel routing disabled entirely (no behavior change to the /v1 API). */
+  tunnelRegistry?: TunnelRegistry;
+  /** The control-plane API's own hostname, exempted from tunnel routing. Defaults to "api.tinycloud.link". */
+  apiHostname?: string;
+  /** Max bytes accepted for a proxied tunnel request body. Defaults to protocol.ts's DEFAULT_MAX_BODY_BYTES (25MB); overridable via the TUNNEL_MAX_BODY_BYTES env var (see index.ts). */
+  tunnelMaxBodyBytes?: number;
 }
 
 // Prefixes name-update entries so they share the cert rate-limit store without
@@ -37,6 +45,16 @@ export function createServer(config: ServerConfig): Hono {
   const app = new Hono();
   const rateLimit = config.certRateLimitPerDay ?? 5;
   const nameUpdateRateLimit = config.nameUpdateRateLimitPerDay ?? 30;
+
+  if (config.tunnelRegistry) {
+    app.use(
+      "*",
+      createTunnelMiddleware(config.tunnelRegistry, {
+        apiHostname: config.apiHostname ?? DEFAULT_API_HOSTNAME,
+        maxBodyBytes: config.tunnelMaxBodyBytes,
+      })
+    );
+  }
 
   app.get("/health", (c) => c.json({ ok: true }));
 

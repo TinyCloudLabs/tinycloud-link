@@ -10,7 +10,7 @@ import {
   fqdnForName,
 } from "./names.js";
 import { createServer } from "./server.js";
-import { createTestCsr } from "./test-support/csr.js";
+import { createTestCsr, createTestEcCsr } from "./test-support/csr.js";
 import { FakeAcmeClient } from "./test-support/fake-acme-client.js";
 import { InMemoryCertRateLimiter, InMemoryNameStore } from "./test-support/memory-stores.js";
 import { didKeySigner, type Signer } from "./test-support/signing.js";
@@ -229,6 +229,32 @@ test("issues a certificate for an owned name via DNS-01", async () => {
   };
   const signature = await signer.sign(canonicalCertRequestPayload(unsigned));
   const res = await app.request("/v1/certs/certnode", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ ...unsigned, signature }),
+  });
+  assert.equal(res.status, 200);
+  const body = (await res.json()) as { certChainPem: string; notAfter: string };
+  assert.match(body.certChainPem, /BEGIN CERTIFICATE/);
+  assert.equal(Number.isNaN(Date.parse(body.notAfter)), false);
+});
+
+test("issues a certificate for an owned name via an ECDSA P-256 CSR", async () => {
+  const { app } = buildApp();
+  const signer = didKeySigner(39);
+  await claim(app, "ecdsanode", signer, ["192.168.1.22"], 1);
+  const domain = fqdnForName("ecdsanode");
+  const csr = await createTestEcCsr(domain);
+  const unsigned = {
+    version: 1 as const,
+    action: "cert" as const,
+    name: "ecdsanode",
+    subject: signer.subject,
+    csr,
+    sequence: 2,
+  };
+  const signature = await signer.sign(canonicalCertRequestPayload(unsigned));
+  const res = await app.request("/v1/certs/ecdsanode", {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify({ ...unsigned, signature }),

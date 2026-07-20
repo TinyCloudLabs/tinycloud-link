@@ -4,6 +4,9 @@ import { DnsO1AcmeIssuer } from "./acme.js";
 import { CloudflareDnsProvider } from "./dns/cloudflare.js";
 import { PostgresAcmeAccountStore, PostgresCertRateLimiter, PostgresNameStore } from "./postgres.js";
 import { createServer } from "./server.js";
+import { DEFAULT_API_HOSTNAME } from "./tunnel/host-router.js";
+import { TunnelRegistry } from "./tunnel/registry.js";
+import { attachTunnelUpgrade } from "./tunnel/upgrade.js";
 
 const port = Number.parseInt(process.env.PORT ?? "3000", 10);
 const databaseUrl = process.env.DATABASE_URL;
@@ -12,6 +15,12 @@ const cloudflareZoneId = process.env.CLOUDFLARE_ZONE_ID;
 const acmeEmail = process.env.ACME_EMAIL;
 const acmeDirectory =
   process.env.ACME_DIRECTORY ?? "https://acme-staging-v02.api.letsencrypt.org/directory";
+const tunnelMaxBodyBytes = process.env.TUNNEL_MAX_BODY_BYTES
+  ? Number.parseInt(process.env.TUNNEL_MAX_BODY_BYTES, 10)
+  : undefined;
+const tunnelMaxConcurrent = process.env.TUNNEL_MAX_CONCURRENT
+  ? Number.parseInt(process.env.TUNNEL_MAX_CONCURRENT, 10)
+  : undefined;
 
 if (!databaseUrl) throw new Error("DATABASE_URL is required");
 if (!cloudflareApiToken) throw new Error("CLOUDFLARE_API_TOKEN is required");
@@ -45,15 +54,26 @@ const acmeIssuer = new DnsO1AcmeIssuer({
   dnsProvider,
 });
 
+const tunnelRegistry = new TunnelRegistry();
+const apiHostname = process.env.API_HOSTNAME ?? DEFAULT_API_HOSTNAME;
+
 const app = createServer({
   nameStore,
   dnsProvider,
   acmeIssuer,
   rateLimiter,
   attestationDocument: process.env.ATTESTATION_DOCUMENT,
+  tunnelRegistry,
+  apiHostname,
+  tunnelMaxBodyBytes,
 });
 
-serve({ fetch: app.fetch, port });
+const server = serve({ fetch: app.fetch, port });
+attachTunnelUpgrade(server, {
+  registry: tunnelRegistry,
+  nameStore,
+  maxConcurrentTunnels: tunnelMaxConcurrent,
+});
 console.log(`tinycloud-link listening on :${port}`);
 
 const shutdown = async () => {
