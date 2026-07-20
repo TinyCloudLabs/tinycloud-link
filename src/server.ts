@@ -33,6 +33,17 @@ export interface ServerConfig {
   apiHostname?: string;
   /** Max bytes accepted for a proxied tunnel request body. Defaults to protocol.ts's DEFAULT_MAX_BODY_BYTES (25MB); overridable via the TUNNEL_MAX_BODY_BYTES env var (see index.ts). */
   tunnelMaxBodyBytes?: number;
+  /**
+   * Shared secret proving a request's X-Forwarded-Host header actually came
+   * from the Cloudflare Worker front (see worker/, and README's "Cloudflare
+   * Worker front" section) rather than a caller spoofing it directly against
+   * this process. When set, a request presenting a matching X-Front-Secret
+   * is routed by X-Forwarded-Host instead of Host; otherwise (unset, or
+   * present but not matching) X-Forwarded-Host is ignored entirely and
+   * routing falls back to Host, unchanged from before the Worker front
+   * existed. Set via the TUNNEL_FRONT_SECRET env var (see index.ts).
+   */
+  tunnelFrontSecret?: string;
 }
 
 // Prefixes name-update entries so they share the cert rate-limit store without
@@ -52,6 +63,7 @@ export function createServer(config: ServerConfig): Hono {
       createTunnelMiddleware(config.tunnelRegistry, {
         apiHostname: config.apiHostname ?? DEFAULT_API_HOSTNAME,
         maxBodyBytes: config.tunnelMaxBodyBytes,
+        frontSecret: config.tunnelFrontSecret,
       })
     );
   }

@@ -21,6 +21,7 @@ const tunnelMaxBodyBytes = process.env.TUNNEL_MAX_BODY_BYTES
 const tunnelMaxConcurrent = process.env.TUNNEL_MAX_CONCURRENT
   ? Number.parseInt(process.env.TUNNEL_MAX_CONCURRENT, 10)
   : undefined;
+const tunnelFrontSecret = process.env.TUNNEL_FRONT_SECRET || undefined;
 
 if (!databaseUrl) throw new Error("DATABASE_URL is required");
 if (!cloudflareApiToken) throw new Error("CLOUDFLARE_API_TOKEN is required");
@@ -66,6 +67,7 @@ const app = createServer({
   tunnelRegistry,
   apiHostname,
   tunnelMaxBodyBytes,
+  tunnelFrontSecret,
 });
 
 const server = serve({ fetch: app.fetch, port });
