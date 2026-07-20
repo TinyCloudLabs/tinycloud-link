@@ -1,0 +1,23 @@
+name = "tinycloud-link-front"
+main = "src/index.ts"
+compatibility_date = "2026-07-19"
+
+# account_id is intentionally omitted here -- wrangler resolves it from the
+# CLOUDFLARE_ACCOUNT_ID environment variable at deploy time (falling back to
+# an interactive account picker if unset and the token has access to more
+# than one account). Do not hardcode a real account id into this checked-in
+# file. See README.md "Cloudflare Worker front" for the full deploy runbook.
+
+# Cloudflare Workers route patterns have no exclusion/negation syntax: a
+# leading "*." pattern matches every subhost of the zone, including
+# api.tinycloud.link, and there is no way to carve that hostname out at the
+# routing layer. src/index.ts handles it in code instead (see the
+# ORIGIN_HOSTNAME passthrough branch) -- in normal operation this branch is
+# moot anyway, because api.tinycloud.link's own DNS record is unproxied
+# (DNS-only), so requests to it never actually reach a Cloudflare Worker.
+[[routes]]
+pattern = "*.tinycloud.link/*"
+zone_name = "tinycloud.link"
+
+# FRONT_SECRET is a Worker secret, not a var: `wrangler secret put FRONT_SECRET`.
+# Never put it in this file. It must match TUNNEL_FRONT_SECRET on the relay.

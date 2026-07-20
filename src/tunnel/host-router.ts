@@ -1,3 +1,4 @@
+import { timingSafeEqual } from "node:crypto";
 import type { Context, MiddlewareHandler } from "hono";
 import { REMOTE_DOMAIN_SUFFIX } from "../names.js";
 import { DEFAULT_MAX_BODY_BYTES } from "./protocol.js";
@@ -5,6 +6,23 @@ import { TunnelProxyError, TunnelProxyTimeoutError, proxyRequest } from "./proxy
 import type { TunnelRegistry } from "./registry.js";
 
 export const DEFAULT_API_HOSTNAME = "api.tinycloud.link";
+
+// Headers the Cloudflare Worker front (see worker/src/index.ts) adds so the
+// relay can recover the client's real Host: TLS for *.tinycloud.link now
+// terminates at Cloudflare rather than at dstack-ingress, so every request
+// this process sees has already been re-fetched by the Worker against
+// `apiHostname`, and the original Host is gone. X_FORWARDED_HOST carries it
+// back; X_FRONT_SECRET proves the pair actually came from the Worker rather
+// than from a caller spoofing X-Forwarded-Host directly against the relay.
+const X_FORWARDED_HOST = "x-forwarded-host";
+const X_FRONT_SECRET = "x-front-secret";
+
+/** Constant-time string equality, used to compare the front secret so a mismatched guess can't be timed. */
+function secretsMatch(a: string, b: string): boolean {
+  const bufA = Buffer.from(a);
+  const bufB = Buffer.from(b);
+  return bufA.length === bufB.length && timingSafeEqual(bufA, bufB);
+}
 
 class RequestBodyTooLargeError extends Error {}
 
@@ -78,12 +96,24 @@ const HOP_BY_HOP_HEADERS = new Set(["connection", "keep-alive", "transfer-encodi
  */
 export function createTunnelMiddleware(
   registry: TunnelRegistry,
-  opts: { apiHostname: string; maxBodyBytes?: number }
+  opts: { apiHostname: string; maxBodyBytes?: number; frontSecret?: string }
 ): MiddlewareHandler {
   const maxBodyBytes = opts.maxBodyBytes ?? DEFAULT_MAX_BODY_BYTES;
 
   return async (c: Context, next) => {
-    const name = remoteNameFromHost(c.req.header("host"), opts.apiHostname);
+    // Only trust X-Forwarded-Host when a front secret is configured *and*
+    // the request's X-Front-Secret matches it. Otherwise resolve strictly
+    // from Host, exactly as before the Worker front existed -- a caller
+    // hitting the relay directly and spoofing X-Forwarded-Host without the
+    // secret has no effect.
+    const presentedSecret = c.req.header(X_FRONT_SECRET);
+    const trusted =
+      opts.frontSecret !== undefined &&
+      presentedSecret !== undefined &&
+      secretsMatch(presentedSecret, opts.frontSecret);
+    const host = trusted ? c.req.header(X_FORWARDED_HOST) : c.req.header("host");
+
+    const name = remoteNameFromHost(host, opts.apiHostname);
     if (!name) {
       await next();
       return;
@@ -96,9 +126,13 @@ export function createTunnelMiddleware(
 
     const headers: Array<[string, string]> = [];
     c.req.raw.headers.forEach((value, key) => {
-      if (!HOP_BY_HOP_HEADERS.has(key.toLowerCase())) {
-        headers.push([key, value]);
-      }
+      const lower = key.toLowerCase();
+      if (HOP_BY_HOP_HEADERS.has(lower)) return;
+      // Strip the Worker-front headers themselves once trusted -- they
+      // describe the Worker->relay hop, not something the tunneled node
+      // should ever see (and the secret must never leave this process).
+      if (trusted && (lower === X_FORWARDED_HOST || lower === X_FRONT_SECRET)) return;
+      headers.push([key, value]);
     });
 
     const url = new URL(c.req.url);

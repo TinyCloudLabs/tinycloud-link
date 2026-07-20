@@ -28,7 +28,8 @@ type UpgradeOverrides = Partial<Omit<AttachTunnelUpgradeOptions, "registry" | "n
 
 async function startTunnelServer(
   upgradeOverrides: UpgradeOverrides = {},
-  tunnelMaxBodyBytes?: number
+  tunnelMaxBodyBytes?: number,
+  tunnelFrontSecret?: string
 ) {
   const nameStore = new InMemoryNameStore();
   const dnsProvider = new InMemoryDnsProvider();
@@ -51,6 +52,7 @@ async function startTunnelServer(
     tunnelRegistry: registry,
     apiHostname: API_HOSTNAME,
     tunnelMaxBodyBytes,
+    tunnelFrontSecret,
   });
 
   const server = await new Promise<ReturnType<typeof serve>>((resolve) => {
@@ -88,9 +90,10 @@ type TunnelTestHarness = Awaited<ReturnType<typeof startTunnelServer>>;
 async function withHarness(
   body: (harness: TunnelTestHarness) => Promise<void>,
   upgradeOverrides: UpgradeOverrides = {},
-  tunnelMaxBodyBytes?: number
+  tunnelMaxBodyBytes?: number,
+  tunnelFrontSecret?: string
 ): Promise<void> {
-  const harness = await startTunnelServer(upgradeOverrides, tunnelMaxBodyBytes);
+  const harness = await startTunnelServer(upgradeOverrides, tunnelMaxBodyBytes, tunnelFrontSecret);
   try {
     await body(harness);
   } finally {
@@ -550,4 +553,155 @@ test("a global concurrent-tunnel cap drops further connection attempts once reac
       assert.equal(await connectionWasRejected(second), true);
     },
     { maxConcurrentTunnels: 1 }
+  ));
+
+// The Cloudflare Worker front (worker/, see README's "Cloudflare Worker
+// front" section) re-fetches every request against API_HOSTNAME, so the
+// original Host the client asked for arrives instead as X-Forwarded-Host,
+// authenticated by X-Front-Secret. These tests exercise host-router.ts's
+// trust decision directly over HTTP, without going through an actual Worker.
+const FRONT_SECRET = "test-front-secret";
+
+test("a request with a matching X-Front-Secret is routed by X-Forwarded-Host, not Host", () =>
+  withHarness(
+    async (harness) => {
+      const signer = didKeySigner(121);
+      await claim(harness.app, "trusted-target", signer, 1);
+
+      const ws = harness.connect("trusted-target");
+      const ackPromise = waitForMessage(ws);
+      await sendAuth(ws, signer, "trusted-target", 2);
+      await ackPromise;
+      runEchoNode(ws);
+
+      // Host names the control-plane API itself; only a trusted
+      // X-Forwarded-Host should make this resolve to the tunnel instead.
+      const res = await harness.app.request("/hello", {
+        method: "POST",
+        headers: {
+          host: API_HOSTNAME,
+          "x-forwarded-host": "trusted-target.tinycloud.link",
+          "x-front-secret": FRONT_SECRET,
+        },
+        body: "ping",
+      });
+      assert.equal(res.status, 200);
+      assert.equal(await res.text(), "ping");
+    },
+    {},
+    undefined,
+    FRONT_SECRET
+  ));
+
+test("a spoofed X-Forwarded-Host with no X-Front-Secret is ignored: routing still resolves from Host", () =>
+  withHarness(
+    async (harness) => {
+      const signer = didKeySigner(122);
+      await claim(harness.app, "spoof-target-a", signer, 1);
+      const ws = harness.connect("spoof-target-a");
+      const ackPromise = waitForMessage(ws);
+      await sendAuth(ws, signer, "spoof-target-a", 2);
+      await ackPromise;
+      runEchoNode(ws);
+
+      // Host names a real but disconnected tunnel; X-Forwarded-Host points at
+      // the live one above. If it were trusted this would proxy through and
+      // return 200; ignored, it must 502 for the (Host-named) dead tunnel.
+      const res = await harness.app.request("/hello", {
+        headers: {
+          host: "unclaimed-name.tinycloud.link",
+          "x-forwarded-host": "spoof-target-a.tinycloud.link",
+        },
+      });
+      assert.equal(res.status, 502);
+    },
+    {},
+    undefined,
+    FRONT_SECRET
+  ));
+
+test("a spoofed X-Forwarded-Host with a wrong X-Front-Secret is ignored: routing still resolves from Host", () =>
+  withHarness(
+    async (harness) => {
+      const signer = didKeySigner(123);
+      await claim(harness.app, "spoof-target-b", signer, 1);
+      const ws = harness.connect("spoof-target-b");
+      const ackPromise = waitForMessage(ws);
+      await sendAuth(ws, signer, "spoof-target-b", 2);
+      await ackPromise;
+      runEchoNode(ws);
+
+      const res = await harness.app.request("/hello", {
+        headers: {
+          host: "unclaimed-name.tinycloud.link",
+          "x-forwarded-host": "spoof-target-b.tinycloud.link",
+          "x-front-secret": "not-the-real-secret",
+        },
+      });
+      assert.equal(res.status, 502);
+    },
+    {},
+    undefined,
+    FRONT_SECRET
+  ));
+
+test("without TUNNEL_FRONT_SECRET configured, X-Forwarded-Host is ignored even if X-Front-Secret is present", () =>
+  withHarness(async (harness) => {
+    const signer = didKeySigner(124);
+    await claim(harness.app, "spoof-target-c", signer, 1);
+    const ws = harness.connect("spoof-target-c");
+    const ackPromise = waitForMessage(ws);
+    await sendAuth(ws, signer, "spoof-target-c", 2);
+    await ackPromise;
+    runEchoNode(ws);
+
+    const res = await harness.app.request("/hello", {
+      headers: {
+        host: "unclaimed-name.tinycloud.link",
+        "x-forwarded-host": "spoof-target-c.tinycloud.link",
+        "x-front-secret": "anything",
+      },
+    });
+    assert.equal(res.status, 502);
+  }));
+
+test("once trusted, X-Forwarded-Host and X-Front-Secret are stripped from headers proxied into the tunnel", () =>
+  withHarness(
+    async (harness) => {
+      const signer = didKeySigner(125);
+      await claim(harness.app, "stripped-headers", signer, 1);
+
+      const ws = harness.connect("stripped-headers");
+      const ackPromise = waitForMessage(ws);
+      await sendAuth(ws, signer, "stripped-headers", 2);
+      await ackPromise;
+
+      let capturedHeaders: Array<[string, string]> | undefined;
+      ws.on("message", (data) => {
+        const frame = parseFrame(data.toString());
+        if (frame.type === "request") {
+          capturedHeaders = frame.headers;
+        }
+      });
+      runEchoNode(ws);
+
+      const res = await harness.app.request("/x", {
+        headers: {
+          host: API_HOSTNAME,
+          "x-forwarded-host": "stripped-headers.tinycloud.link",
+          "x-front-secret": FRONT_SECRET,
+          "x-custom": "hello",
+        },
+      });
+      assert.equal(res.status, 200);
+      assert.ok(Array.isArray(capturedHeaders));
+      assert.ok(
+        capturedHeaders?.some(([key, value]) => key.toLowerCase() === "x-custom" && value === "hello")
+      );
+      assert.ok(!capturedHeaders?.some(([key]) => key.toLowerCase() === "x-forwarded-host"));
+      assert.ok(!capturedHeaders?.some(([key]) => key.toLowerCase() === "x-front-secret"));
+    },
+    {},
+    undefined,
+    FRONT_SECRET
   ));

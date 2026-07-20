@@ -171,18 +171,59 @@ Rules a node client must follow:
 
 ### Ingress and TLS for tunnels
 
-TLS for `https://<name>.tinycloud.link` terminates **at the relay's front door, with one wildcard certificate** -- not with per-name certificates, and not inside this Node process.
+**Superseded design, kept for history:** the original plan was `dstack-ingress` fronting a wildcard `DOMAIN=*.tinycloud.link` with one relay-side wildcard certificate (see git history for the full writeup). **Verdict: rejected.** A staging CVM confirmed dstack-ingress's own wildcard ACME issuance works, but the dstack gateway silently reset every TLS handshake for a wildcard SNI (`[dstack#545](https://github.com/Dstack-TEE/dstack/pull/545)` support isn't present on this dstack generation) -- see the TC-85 Linear comment for the full repro (`openssl s_client` against `api.tinycloud.link` succeeds; against any `*.staging.tinycloud.link` name, TCP connects and the ClientHello goes out, then the connection is silently reset). dstack-ingress therefore stays single-hostname (`DOMAIN=api.tinycloud.link`, see `docker-compose.phala.yml`) indefinitely, not just as a fallback.
 
-The constraint that forces this: on Phala, this service runs behind `dstack-ingress` (see `docker-compose.phala.yml`), an HAProxy-based L4 TCP proxy that terminates TLS itself using its own certbot/DNS-01 machinery and forwards the decrypted stream to `TARGET_ENDPOINT`. Everything arriving on the CVM's public `:443` goes through it. From inside the CVM there is no per-SNI certificate hook: this repo's process never sees the TLS handshake, and `dstack-ingress` serves the certificates *it* obtained at bootstrap, not ones handed to it at runtime by another container. So the "extend the ACME issuer to obtain a cert for each `<name>.tinycloud.link` on tunnel registration" design is a dead end in this deployment model -- this process could *obtain* those certs (it already has the DNS-01 machinery), but nothing here could ever *serve* them. Design honesty: we don't ship per-name relay certs.
+### Cloudflare Worker front
 
-What ships instead:
+TLS for `https://<name>.tinycloud.link` terminates **at Cloudflare's edge**, not inside this CVM at all. This is the replacement for the rejected wildcard-ingress design above.
 
-- `dstack-ingress` runs with `DOMAIN=*.tinycloud.link` -- it supports wildcard domains natively (wildcard DNS-01 order, `issuewild` CAA). One certificate covers `api.tinycloud.link` and every tunnel name.
-- DNS needs one wildcard record: `*.tinycloud.link` → the same dstack gateway target `api.tinycloud.link` already points at (human step, same as the original `api` wiring). Tunnels create **no** per-name DNS records; the per-name records this service writes remain what they always were -- LAN A/AAAA under `*.local.tinycloud.link`.
-- Behind the ingress, this process routes by `Host` header (`src/tunnel/host-router.ts`): `API_HOSTNAME` (default `api.tinycloud.link`) gets the normal `/v1` API; any other single-label `<name>.tinycloud.link` host is looked up in the tunnel registry and proxied.
-- **Open verification item**: dstack-ingress documents that wildcard `DOMAIN` requires dstack-gateway wildcard TXT resolution support ([dstack#545](https://github.com/Dstack-TEE/dstack/pull/545)). Whether the production gateway has it can't be verified from this repo. If it doesn't, the wildcard ACME order fails at ingress bootstrap; the fallback is `DOMAIN=api.tinycloud.link` (control-plane API keeps working exactly as today, tunnels stay dark) until the gateway supports it. Must be checked on a staging CVM before the tunnel-enabled image is deployed.
+```
+ client                Cloudflare edge              this CVM
+   |                         |                          |
+   | https://foo.tinycloud.link/x                        |
+   |------------------------>|  TLS terminated here      |
+   |                         |  (Cloudflare Universal SSL |
+   |                         |   covers *.tinycloud.link) |
+   |                         |                            |
+   |                         |  Worker (worker/src/index.ts):
+   |                         |  fetch("https://api.tinycloud.link/x",
+   |                         |    { ...same method/body,
+   |                         |      X-Forwarded-Host: foo.tinycloud.link,
+   |                         |      X-Front-Secret: <shared secret> })
+   |                         |--------------------------->|
+   |                         |                          dstack-ingress
+   |                         |                          (DOMAIN=api.tinycloud.link,
+   |                         |                           unrelated cert, unchanged)
+   |                         |                            |
+   |                         |                          tinycloud-link process:
+   |                         |                          host-router.ts sees a
+   |                         |                          trusted X-Forwarded-Host,
+   |                         |                          resolves it to a tunnel name,
+   |                         |                          proxies down that name's
+   |                         |                          WS tunnel to the node
+   |<------------------------|<---------------------------|
+```
 
-Trade-offs accepted: all tunnel names share one certificate (one CT-log entry for `*.tinycloud.link` rather than a per-name entry -- strictly *less* name disclosure than the LAN cert flow, which CT-logs every name); and tunnel TLS terminates in the ingress container rather than end-to-end at the node, meaning plaintext HTTP crosses the CVM-internal hop between ingress and this process -- the same boundary the control-plane API traffic has always crossed.
+Pieces:
+
+- **DNS**: a **proxied** (orange-cloud) wildcard CNAME `*` → `api.tinycloud.link` puts every `<name>.tinycloud.link` request through Cloudflare's network. `api.tinycloud.link` itself keeps its existing **DNS-only** (grey-cloud) record pointing at the dstack gateway target -- unchanged, so a node's direct `wss://api.tinycloud.link/v1/tunnel/<name>` connection (the actual tunnel control channel, see "Lifecycle" above) never touches Cloudflare and keeps working exactly as before. DNS resolves the more specific `api` record over the wildcard, so this split is stable, not a race.
+- **Certificate**: Cloudflare's free Universal SSL certificate already covers any first-level `*.tinycloud.link` hostname once the zone is on Cloudflare -- no per-name or relay-side wildcard cert needed, and nothing here orders one.
+- **Worker** (`worker/`, route `*.tinycloud.link/*`): forwards every request to `https://api.tinycloud.link` unchanged (method, headers, body, streamed), adding `X-Forwarded-Host` (the hostname the client actually asked for) and `X-Front-Secret` (a shared secret proving the pair came from this Worker). Cloudflare route patterns have no exclusion syntax, so the pattern technically also matches `api.tinycloud.link` -- handled defensively in code (see the Worker's `ORIGIN_HOSTNAME` branch), though in practice that hostname's DNS-only status means the Worker never actually sees it.
+- **Relay** (`src/tunnel/host-router.ts`): when `TUNNEL_FRONT_SECRET` is configured and a request's `X-Front-Secret` matches it, routing resolves from `X-Forwarded-Host` instead of `Host` (both headers are stripped before anything is forwarded into the tunnel). Without a configured secret, or with a missing/mismatched one, `X-Forwarded-Host` is ignored entirely and routing falls back to `Host` -- byte-for-byte the pre-Worker behavior, so a caller hitting the relay directly can't spoof a hostname it doesn't actually own by forging that header.
+- **tunnelRegistry is not separately gated.** `src/index.ts` has unconditionally constructed a `TunnelRegistry` and passed it into `createServer` since TC-85 merged -- there's no env var that turns tunnel routing itself on or off. "Enabling tunnels on redeploy" means redeploying the current image (which already has this wired up) behind the new Cloudflare front, not flipping a flag.
+
+Trade-offs accepted: plaintext HTTP crosses the Cloudflare-edge-to-CVM hop (the same trust boundary the control-plane API traffic already crossed via `dstack-ingress`'s own TLS-terminate-and-forward behavior); Cloudflare is now a dependency for tunnel reachability (TC-85's memo flagged this as a cost of any Cloudflare-fronted option, weighed against the alternative -- no reachability at all, since the dstack-gateway wildcard-SNI path is unavailable on this dstack generation); and the shared `X-Front-Secret` is the only thing standing between a direct caller and forging `X-Forwarded-Host` against the relay, so it must be treated with the same care as any other production credential.
+
+#### Deploy runbook
+
+1. `cd worker && npm install`.
+2. `npx wrangler secret put FRONT_SECRET` -- generate a fresh random secret (e.g. `openssl rand -hex 32`); this becomes both the Worker secret and the CVM's `TUNNEL_FRONT_SECRET`.
+3. `CLOUDFLARE_ACCOUNT_ID=<account id> npx wrangler deploy` (from `worker/`). `wrangler.toml` has no `account_id` baked in -- it's resolved from this env var, or wrangler prompts interactively if the token has access to more than one account.
+4. DNS (Cloudflare dashboard or API, `tinycloud.link` zone): add a **proxied** CNAME record, name `*`, target `api.tinycloud.link`. Leave the existing `api` record as-is (DNS-only/grey-cloud).
+5. Add `TUNNEL_FRONT_SECRET` (the same value from step 2) to the CVM's encrypted secrets and redeploy `docker-compose.phala.yml` (already wires it into the `tinycloud-link` service's environment; see below for why a redeploy is also needed for the `dstack-ingress` `DOMAIN` change).
+6. Verify: `curl https://api.tinycloud.link/health` (unchanged, direct path) and, once a node has an active tunnel, `curl https://<claimed-name>.tinycloud.link/...` (now via the Worker).
+
+**Fresh-`POSTGRES_PASSWORD` redeploy plan**: the current prod CVM's real `POSTGRES_PASSWORD` / `CERTBOT_EMAIL` values are not recoverable from any available session transcript (see the TC-85 Linear comment). Rather than guess and risk breaking live Postgres auth, the redeploy that ships this change generates a **fresh** `POSTGRES_PASSWORD` and accepts a fresh Postgres volume: the `names`/`acme_account`/`cert_issuances` tables are disposable (nodes re-claim their names automatically on their next `PUT /v1/names/:name`, which every node already does periodically), so a clean volume is simpler and safer than trying to recover a lost credential. `CERTBOT_EMAIL` likewise gets a fresh value at redeploy time; it only affects Let's Encrypt account notifications for `dstack-ingress`'s own `api.tinycloud.link` cert; it doesn't gate anything for existing certs.
 
 ## DNS provider
 
@@ -234,7 +275,8 @@ docker run -p 3000:3000 --env-file .env tinycloud/tinycloud-link
    - `ACME_EMAIL`
    - `CERTBOT_EMAIL` (used by `dstack-ingress` for the API's own front-door cert)
    - `DSTACK_GATEWAY_DOMAIN`
-4. Point `api.tinycloud.link` at the deployment's dstack gateway (human DNS step, same pattern as `registry.tinycloud.xyz`). For tunnels (TC-85), also point the wildcard `*.tinycloud.link` at the same gateway target and confirm the gateway supports wildcard TXT resolution for the ingress's wildcard cert order -- see "Ingress and TLS for tunnels" above.
+   - `TUNNEL_FRONT_SECRET` (shared with the Cloudflare Worker's `FRONT_SECRET` -- see "Cloudflare Worker front" above for the full runbook, including the Worker deploy and DNS steps)
+4. Point `api.tinycloud.link` at the deployment's dstack gateway (human DNS step, same pattern as `registry.tinycloud.xyz`). This is unchanged from before TC-85: `dstack-ingress`'s `DOMAIN` stays single-hostname (`api.tinycloud.link`), not a wildcard -- see "Ingress and TLS for tunnels" above for why. Tunnel reachability (`<name>.tinycloud.link`) is handled entirely by the Cloudflare Worker front instead, which needs its own DNS/deploy steps (see "Cloudflare Worker front" above), not a change here.
 5. Verify:
    ```bash
    curl https://api.tinycloud.link/health
