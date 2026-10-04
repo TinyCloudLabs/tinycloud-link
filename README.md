@@ -274,9 +274,9 @@ docker run -p 3000:3000 --env-file .env tinycloud/tinycloud-link
    - `CLOUDFLARE_ZONE_ID` (**not provisioned** -- needs the `tinycloud.link` zone to exist in Cloudflare and its zone id)
    - `ACME_EMAIL`
    - `CERTBOT_EMAIL` (used by `dstack-ingress` for the API's own front-door cert)
-   - `DSTACK_GATEWAY_DOMAIN`
+   - `DSTACK_GATEWAY_DOMAIN` (the gateway base domain, e.g. `dstack-pha-prod5.phala.network`; `dstack-ingress` CNAMEs `api.tinycloud.link` to `gateway.<base>`, never `_.<base>`, which Android cannot resolve)
    - `TUNNEL_FRONT_SECRET` (shared with the Cloudflare Worker's `FRONT_SECRET` -- see "Cloudflare Worker front" above for the full runbook, including the Worker deploy and DNS steps)
-4. Point `api.tinycloud.link` at the deployment's dstack gateway (human DNS step, same pattern as `registry.tinycloud.xyz`). This is unchanged from before TC-85: `dstack-ingress`'s `DOMAIN` stays single-hostname (`api.tinycloud.link`), not a wildcard -- see "Ingress and TLS for tunnels" above for why. Tunnel reachability (`<name>.tinycloud.link`) is handled entirely by the Cloudflare Worker front instead, which needs its own DNS/deploy steps (see "Cloudflare Worker front" above), not a change here.
+4. Point `api.tinycloud.link` at the deployment's dstack gateway (human DNS step, same pattern as `registry.tinycloud.xyz`): `CNAME api.tinycloud.link -> gateway.<base>`, the CVM's `gateway.cname` from `phala cvms get`. This is unchanged from before TC-85: `dstack-ingress`'s `DOMAIN` stays single-hostname (`api.tinycloud.link`), not a wildcard -- see "Ingress and TLS for tunnels" above for why. Tunnel reachability (`<name>.tinycloud.link`) is handled entirely by the Cloudflare Worker front instead, which needs its own DNS/deploy steps (see "Cloudflare Worker front" above), not a change here.
 5. Verify:
    ```bash
    curl https://api.tinycloud.link/health
