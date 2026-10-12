@@ -268,7 +268,7 @@ docker run -p 3000:3000 --env-file .env tinycloud/tinycloud-link
 
 1. `phala auth login` (interactive; requires a human with a Phala Cloud account -- **not done for this build**).
 2. Push this repo's image via the `Docker Image` GitHub Actions workflow (builds on `main`, publishes `ghcr.io/tinycloudlabs/tinycloud-link:main`).
-3. In the Phala Cloud Docker Compose editor, paste `docker-compose.phala.yml` and set these encrypted secrets:
+3. In the Phala Cloud Docker Compose editor, paste `docker-compose.phala.yml`, turn **Public Logs off** (Settings → Worker Attestation Visibility; new CVMs default to on), and set these encrypted secrets:
    - `POSTGRES_PASSWORD`
    - `CLOUDFLARE_API_TOKEN` (**not provisioned for this build** -- needs a Cloudflare API token scoped to the `tinycloud.link` zone)
    - `CLOUDFLARE_ZONE_ID` (**not provisioned** -- needs the `tinycloud.link` zone to exist in Cloudflare and its zone id)
