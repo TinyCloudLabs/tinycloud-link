@@ -47,8 +47,11 @@ jobs:
 
       - name: Build image
         uses: docker/build-push-action@v6
+        env:
+          BUILDX_METADATA_PROVENANCE: disabled
         with:
           context: .
+          provenance: false
           platforms: linux/amd64
           push: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
           tags: |
