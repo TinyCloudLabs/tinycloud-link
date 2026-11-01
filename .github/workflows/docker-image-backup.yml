@@ -19,6 +19,10 @@ permissions:
   contents: read
   packages: write
 
+env:
+  # Publish only from main, by push or a manual run of this workflow on main.
+  PUBLISH: ${{ github.ref == 'refs/heads/main' && github.event_name != 'pull_request' }}
+
 jobs:
   build:
     name: Build Backup Sidecar Image
@@ -31,15 +35,40 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
+      # The image runs busybox ash, not the dash the CI test uses, so run the real image once.
+      - name: Build image for smoke test
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.backup
+          provenance: false
+          platforms: linux/amd64
+          load: true
+          tags: tinycloud-link-backup:smoke
+
+      - name: Smoke test image
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker run --rm --entrypoint sh tinycloud-link-backup:smoke -c 'age --version && curl --version >/dev/null && pg_dump --version'
+          if out=$(docker run --rm tinycloud-link-backup:smoke 2>&1); then echo "expected a missing-config failure"; exit 1; fi
+          grep -q 'PGHOST is required' <<<"$out"
+          if out=$(docker run --rm -e PGHOST=x -e PGUSER=x -e PGPASSWORD=x -e PGDATABASE=x \
+            -e LINK_BACKUP_R2_ENDPOINT=http://x -e LINK_BACKUP_R2_BUCKET=x -e LINK_BACKUP_R2_ACCESS_KEY_ID=x \
+            -e LINK_BACKUP_R2_SECRET_ACCESS_KEY=x -e LINK_BACKUP_AGE_RECIPIENT=AGE-SECRET-KEY-1NOTAREALKEY \
+            tinycloud-link-backup:smoke 2>&1); then echo "expected the private key to be refused"; exit 1; fi
+          grep -q 'PRIVATE key' <<<"$out"
+          if grep -q 'NOTAREALKEY' <<<"$out"; then echo "the refused private key was echoed"; exit 1; fi
+
       - name: Log in to GitHub Container Registry
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        if: env.PUBLISH == 'true'
         uses: docker/login-action@v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build image
+      - name: Build and publish image
         id: image
         uses: docker/build-push-action@v6
         env:
@@ -49,13 +78,13 @@ jobs:
           file: Dockerfile.backup
           provenance: false
           platforms: linux/amd64
-          push: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+          push: ${{ env.PUBLISH == 'true' }}
           tags: |
             ghcr.io/tinycloudlabs/tinycloud-link-backup:${{ github.sha }}
 
       # LINK_BACKUP_IMAGE in the CVM's sealed env is this immutable reference, not a tag.
       - name: Record immutable image digest
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        if: env.PUBLISH == 'true'
         shell: bash
         run: |
           digest="${{ steps.image.outputs.digest }}"

@@ -45,9 +45,10 @@ function run(command, args, env) {
 const tools = ["age", "age-keygen", "pg_dump", "pg_restore", "psql", "createdb", "dropdb", "curl"];
 const missing = tools.filter((tool) => spawnSync("sh", ["-c", `command -v ${tool}`]).status !== 0);
 const dbReady = missing.length === 0 && spawnSync("psql", ["-d", "postgres", "-Atqc", "select 1"]).status === 0;
-const skip = dbReady ? false : `needs ${missing.join(", ") || "a reachable Postgres via PG* env"}`;
+// On CI a missing tool or database is a failure, never a silent skip that leaves the job green.
+const skip = dbReady || process.env.CI ? false : `needs ${missing.join(", ") || "a reachable Postgres via PG* env"}`;
 
-function mockR2() {
+function mockR2(snapshot) {
   const objects = new Map();
   const seen = [];
   let failUploads = false;
@@ -56,7 +57,7 @@ function mockR2() {
     req.on("data", (chunk) => chunks.push(chunk));
     req.on("end", () => {
       const url = new URL(req.url, "http://mock");
-      seen.push({ method: req.method, path: url.pathname, authorization: req.headers.authorization, sha: req.headers["x-amz-content-sha256"], ifNoneMatch: req.headers["if-none-match"] });
+      seen.push({ method: req.method, path: url.pathname, authorization: req.headers.authorization, sha: req.headers["x-amz-content-sha256"], ifNoneMatch: req.headers["if-none-match"], files: snapshot?.() });
       if (req.method === "PUT") {
         if (failUploads) return res.writeHead(500).end();
         objects.set(url.pathname, Buffer.concat(chunks));
@@ -85,7 +86,14 @@ test("backup uploads an age-encrypted dump that the restore drill restores", { s
   const suffix = `${process.pid}_${Date.now()}`;
   const source = `link_backup_src_${suffix}`;
   const target = `link_backup_dst_${suffix}`;
-  const r2 = mockR2();
+  // Called while a PUT is in flight: what exists in the sidecar's tmpfs at the moment of upload.
+  const r2 = mockR2(() => {
+    try {
+      return readdirSync(join(work, "tmpfs"), { recursive: true });
+    } catch {
+      return [];
+    }
+  });
   const endpoint = await r2.listen();
   try {
     assert.equal((await run("createdb", [source])).status, 0);
@@ -153,6 +161,22 @@ test("backup uploads an age-encrypted dump that the restore drill restores", { s
     assert.equal(r2.objects.size, 0);
     assert.deepEqual(readdirSync(scratch), []);
 
+    // A pg_dump failure uploads nothing. In the retry loop (`if backup_once`, where `set -e` is off) it
+    // must be reported and retried, and TERM must exit promptly with the tmpfs cleaned.
+    const loop = spawn("sh", [backupScript], {
+      env: { ...process.env, ...base, BACKUP_ONCE: "", PGDATABASE: "link_backup_does_not_exist", BACKUP_RETRY_SECONDS: "600" },
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    let loopErr = "";
+    loop.stderr.on("data", (chunk) => (loopErr += chunk));
+    const loopEnd = new Promise((resolve) => loop.on("close", (code) => resolve(code)));
+    for (let waited = 0; !loopErr.includes("backup: FAILED") && waited < 100; waited++) await new Promise((resolve) => setTimeout(resolve, 100));
+    assert.match(loopErr, /backup: FAILED; retrying in 600s/);
+    loop.kill("SIGTERM");
+    assert.equal(await loopEnd, 143);
+    assert.equal(r2.objects.size, 0);
+    assert.deepEqual(readdirSync(scratch), []);
+
     const backup = await run("sh", [backupScript], base);
     assert.equal(backup.status, 0, backup.err);
     assert.deepEqual(readdirSync(scratch), []);
@@ -166,6 +190,9 @@ test("backup uploads an age-encrypted dump that the restore drill restores", { s
     assert.match(put.authorization, /^AWS4-HMAC-SHA256 Credential=test-key-id\/\d{8}\/auto\/s3\/aws4_request/);
     assert.equal(put.sha, "UNSIGNED-PAYLOAD");
     assert.equal(put.ifNoneMatch, "*");
+    // "Deleted before upload": at the moment of the PUT only the ciphertext is on the tmpfs.
+    assert.ok(put.files.some((file) => file.endsWith("dump.age")), "ciphertext must be on the tmpfs during upload");
+    assert.ok(!put.files.some((file) => /(^|\/)dump$/.test(file)), "plaintext dump must be gone before upload");
     const argv = readFileSync(argvLog, "utf8");
     assert.match(argv, /--aws-sigv4/);
     assert.ok(!argv.includes("test-secret-value") && !argv.includes("test-key-id"), "R2 credentials must not be passed in curl's argv");

@@ -53,6 +53,10 @@ cleanup() {
   rm -rf "$work"
 }
 trap cleanup EXIT
+# A fatal signal does not run the EXIT trap in POSIX sh; exit explicitly so the decrypted dump
+# and the throwaway container are always removed.
+trap 'exit 130' INT
+trap 'exit 143' TERM HUP
 
 s3() { # s3 <path-and-query> [curl args...]; credentials go to curl on stdin, not argv
   path=$1; shift

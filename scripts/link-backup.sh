@@ -31,12 +31,14 @@ esac
 
 # mktemp honours TMPDIR and falls back to /tmp, which the compose service mounts as tmpfs.
 work=$(mktemp -d)
-trap 'rm -rf "$work"' EXIT
+sleeper=
+trap 'rm -rf "$work"; [ -z "$sleeper" ] || kill "$sleeper" 2>/dev/null || true' EXIT
 # Exit promptly on `docker stop`; EXIT then removes $work.
 trap 'exit 143' TERM INT
 
 # Interruptible sleep: a trap only runs between commands, so a foreground sleep would delay TERM handling.
-nap() { sleep "$1" & wait $!; }
+# The EXIT trap kills the background sleep so it does not outlive the script.
+nap() { sleep "$1" & sleeper=$!; wait "$sleeper"; sleeper=; }
 
 backup_once() {
   stamp=$(date -u +%Y%m%dT%H%M%SZ)
