@@ -267,7 +267,7 @@ docker run -p 3000:3000 --env-file .env tinycloud/tinycloud-link
 `docker-compose.phala.yml` is the production template: it runs the API, Postgres, and `dstack-ingress` for a public HTTPS front door at `api.tinycloud.link` (the control-plane API's own hostname -- distinct from the `*.local.tinycloud.link` zone it manages for nodes).
 
 1. `phala auth login` (interactive; requires a human with a Phala Cloud account -- **not done for this build**).
-2. Push this repo's image via the `Docker Image` GitHub Actions workflow (builds on `main`, publishes `ghcr.io/tinycloudlabs/tinycloud-link:main`).
+2. Push this repo's image via the `Docker Image` GitHub Actions workflow (builds on `main`, publishes `ghcr.io/tinycloudlabs/tinycloud-link:main` and `:<commit sha>`). The compose pins the `tinycloud-link` service by digest, not by `:main`: to ship new code, set `image:` in `docker-compose.phala.yml` to `ghcr.io/tinycloudlabs/tinycloud-link:<sha>@sha256:<digest>` (`docker buildx imagetools inspect ghcr.io/tinycloudlabs/tinycloud-link:<sha>` prints the digest) in a reviewed commit.
 3. In the Phala Cloud Docker Compose editor, paste `docker-compose.phala.yml`, turn **Public Logs off** (Settings → Worker Attestation Visibility; new CVMs default to on), and set these encrypted secrets:
    - `POSTGRES_PASSWORD`
    - `CLOUDFLARE_API_TOKEN` (**not provisioned for this build** -- needs a Cloudflare API token scoped to the `tinycloud.link` zone)
