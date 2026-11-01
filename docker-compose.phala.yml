@@ -82,6 +82,39 @@ services:
       retries: 5
     restart: unless-stopped
 
+  # Encrypted Postgres backup (TC-887). Phala keeps no copy of a CVM's disk, so
+  # this is the only copy of the data outside the CVM. Every 6 h: pg_dump -Fc ->
+  # age (PUBLIC recipient only) -> Cloudflare R2. The image is built from
+  # Dockerfile.backup by the Docker Image workflow and selected by immutable
+  # digest (LINK_BACKUP_IMAGE). The CVM holds only the age PUBLIC recipient; the
+  # identity (private key) is operator-held off-CVM. See README "Backups and
+  # restore drill".
+  postgres-backup:
+    image: ${LINK_BACKUP_IMAGE:?set LINK_BACKUP_IMAGE to the immutable ghcr.io/tinycloudlabs/tinycloud-link-backup@sha256 reference}
+    # tini as PID 1 so `docker stop` signals reach the script.
+    init: true
+    # The plaintext dump lives only in this RAM-backed mount, never on the
+    # container's overlay disk. 512m bounds it: the compressed dump and its
+    # age copy coexist briefly, so size it above ~2x the compressed dump.
+    # Counts against CVM memory; re-check as the database grows.
+    tmpfs:
+      - /tmp:size=512m,mode=1700
+    environment:
+      - PGHOST=postgres
+      - PGUSER=tinycloud_link
+      - PGPASSWORD=${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}
+      - PGDATABASE=tinycloud_link
+      - LINK_BACKUP_R2_ENDPOINT=${LINK_BACKUP_R2_ENDPOINT:?set LINK_BACKUP_R2_ENDPOINT}
+      - LINK_BACKUP_R2_BUCKET=${LINK_BACKUP_R2_BUCKET:?set LINK_BACKUP_R2_BUCKET}
+      - LINK_BACKUP_R2_ACCESS_KEY_ID=${LINK_BACKUP_R2_ACCESS_KEY_ID:?set LINK_BACKUP_R2_ACCESS_KEY_ID}
+      - LINK_BACKUP_R2_SECRET_ACCESS_KEY=${LINK_BACKUP_R2_SECRET_ACCESS_KEY:?set LINK_BACKUP_R2_SECRET_ACCESS_KEY}
+      - LINK_BACKUP_AGE_RECIPIENT=${LINK_BACKUP_AGE_RECIPIENT:?set LINK_BACKUP_AGE_RECIPIENT to the age1... public recipient}
+      - BACKUP_INTERVAL_SECONDS=21600
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
 volumes:
   tinycloud-link-cert-data:
   tinycloud-link-postgres-data:

@@ -35,3 +35,42 @@ jobs:
 
       - name: Build
         run: npm run build
+
+  backup:
+    name: 'Backup & Restore Drill'
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_PASSWORD: ci
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Install PostgreSQL 17 client and age
+        run: |
+          sudo /usr/share/postgresql-common/pgdg/apt.postgresql.org.sh -y
+          sudo apt-get install -y postgresql-client-17 age
+          echo "/usr/lib/postgresql/17/bin" >> "${GITHUB_PATH}"
+
+      - name: Back up, encrypt, upload (stub S3) and restore a real Postgres 17
+        env:
+          PGHOST: 127.0.0.1
+          PGPORT: '5432'
+          PGUSER: postgres
+          PGPASSWORD: ci
+        run: node --test scripts/link-backup.test.mjs
