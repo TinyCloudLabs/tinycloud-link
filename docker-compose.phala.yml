@@ -40,7 +40,12 @@ services:
     restart: unless-stopped
 
   tinycloud-link:
-    image: ghcr.io/tinycloudlabs/tinycloud-link:main
+    # Pinned by digest (TC-887): the floating `:main` tag meant any reboot or
+    # redeploy could silently pull different code. This is the image the
+    # production CVM was running (commit f769c60, manifest 1fbb2523...). To ship
+    # new code, put the new commit's `:<sha>` tag and its digest here
+    # (`docker buildx imagetools inspect ghcr.io/tinycloudlabs/tinycloud-link:<sha>`).
+    image: ghcr.io/tinycloudlabs/tinycloud-link:f769c6041e083e3a22759cdf416c903ea3dc4115@sha256:1fbb25236f7c5d6201306fcf6413efc4a87b190b02bf26da09bfc92e69d42d2a
     environment:
       - PORT=3000
       - DATABASE_URL=postgres://tinycloud_link:${POSTGRES_PASSWORD}@postgres:5432/tinycloud_link
