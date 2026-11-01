@@ -1,10 +1,10 @@
 # Sidecar image for the encrypted Postgres backup loop (TC-887).
-# Base is the same postgres:17-alpine digest the registry backup sidecar uses, so pg_dump matches the
-# postgres:17-alpine server (any 17.x). Alpine keeps only the current package revision per release; if a pin
-# below stops resolving, the build fails loudly. Bump the pins together with the base digest (Alpine 3.24.1
-# at this digest).
+# Base is the postgres:17-alpine digest the registry backup sidecar uses, so pg_dump matches the
+# postgres:17-alpine server (any 17.x). Alpine keeps only the current package revision per release,
+# so these pins rot: when apk stops resolving one, the build fails loudly. Bump the pins to what
+# `apk policy` shows for the base digest.
 FROM postgres:17-alpine@sha256:7456ef82e5f5bc43d997f4781bbd7c0d6389bff397564649a356e206ba473aee
-RUN apk add --no-cache age=1.3.2-r1 curl=8.22.0-r0
+RUN apk add --no-cache age=1.3.2-r1 curl=8.23.0-r0
 COPY --chmod=0755 scripts/link-backup.sh /usr/local/bin/link-backup.sh
 ENTRYPOINT ["/usr/local/bin/link-backup.sh"]
 CMD []
