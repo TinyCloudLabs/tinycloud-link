@@ -81,7 +81,7 @@ function mockR2(snapshot) {
   };
 }
 
-test("backup uploads an age-encrypted dump that the restore drill restores", { skip }, async () => {
+test("backup uploads an age-encrypted dump that the restore drill restores", { skip, timeout: 120_000 }, async () => {
   const work = mkdtempSync(join(tmpdir(), "link-backup-test-"));
   const suffix = `${process.pid}_${Date.now()}`;
   const source = `link_backup_src_${suffix}`;
@@ -95,6 +95,7 @@ test("backup uploads an age-encrypted dump that the restore drill restores", { s
     }
   });
   const endpoint = await r2.listen();
+  let loop;
   try {
     assert.equal((await run("createdb", [source])).status, 0);
     assert.equal((await run("createdb", [target])).status, 0);
@@ -163,7 +164,7 @@ test("backup uploads an age-encrypted dump that the restore drill restores", { s
 
     // A pg_dump failure uploads nothing. In the retry loop (`if backup_once`, where `set -e` is off) it
     // must be reported and retried, and TERM must exit promptly with the tmpfs cleaned.
-    const loop = spawn("sh", [backupScript], {
+    loop = spawn("sh", [backupScript], {
       env: { ...process.env, ...base, BACKUP_ONCE: "", PGDATABASE: "link_backup_does_not_exist", BACKUP_RETRY_SECONDS: "600" },
       stdio: ["ignore", "pipe", "pipe"],
     });
@@ -173,10 +174,12 @@ test("backup uploads an age-encrypted dump that the restore drill restores", { s
     for (let waited = 0; !loopErr.includes("backup: FAILED") && waited < 100; waited++) await new Promise((resolve) => setTimeout(resolve, 100));
     assert.match(loopErr, /backup: FAILED; retrying in 600s/);
     loop.kill("SIGTERM");
-    assert.equal(await loopEnd, 143);
+    const loopTimeout = new Promise((resolve) => setTimeout(() => resolve("timed out"), 10_000).unref());
+    assert.equal(await Promise.race([loopEnd, loopTimeout]), 143);
     assert.equal(r2.objects.size, 0);
     assert.deepEqual(readdirSync(scratch), []);
 
+    const seenBefore = r2.seen.length;
     const backup = await run("sh", [backupScript], base);
     assert.equal(backup.status, 0, backup.err);
     assert.deepEqual(readdirSync(scratch), []);
@@ -186,7 +189,7 @@ test("backup uploads an age-encrypted dump that the restore drill restores", { s
     assert.ok(body.subarray(0, 22).toString().startsWith("age-encryption.org/v1"), "object must be an age file");
     assert.ok(!body.includes(secretMarker), "ciphertext must not contain plaintext name data");
     assert.ok(!body.includes(pemMarker), "ciphertext must not contain the plaintext ACME account key");
-    const put = r2.seen.find((entry) => entry.method === "PUT");
+    const put = r2.seen.slice(seenBefore).find((entry) => entry.method === "PUT");
     assert.match(put.authorization, /^AWS4-HMAC-SHA256 Credential=test-key-id\/\d{8}\/auto\/s3\/aws4_request/);
     assert.equal(put.sha, "UNSIGNED-PAYLOAD");
     assert.equal(put.ifNoneMatch, "*");
@@ -228,6 +231,7 @@ test("backup uploads an age-encrypted dump that the restore drill restores", { s
     assert.notEqual(short.status, 0);
     assert.match(short.err, /expected at least 8 rows in names/);
   } finally {
+    loop?.kill("SIGKILL");
     r2.close();
     await run("dropdb", ["--if-exists", source]);
     await run("dropdb", ["--if-exists", target]);
