@@ -276,6 +276,7 @@ docker run -p 3000:3000 --env-file .env tinycloud/tinycloud-link
    - `CERTBOT_EMAIL` (used by `dstack-ingress` for the API's own front-door cert)
    - `DSTACK_GATEWAY_DOMAIN` (the gateway base domain, e.g. `dstack-pha-prod5.phala.network`; `dstack-ingress` CNAMEs `api.tinycloud.link` to `gateway.<base>`, never `_.<base>`, which Android cannot resolve)
    - `TUNNEL_FRONT_SECRET` (shared with the Cloudflare Worker's `FRONT_SECRET` -- see "Cloudflare Worker front" above for the full runbook, including the Worker deploy and DNS steps)
+   - `LINK_BACKUP_IMAGE`, `LINK_BACKUP_R2_ENDPOINT`, `LINK_BACKUP_R2_BUCKET`, `LINK_BACKUP_R2_ACCESS_KEY_ID`, `LINK_BACKUP_R2_SECRET_ACCESS_KEY`, `LINK_BACKUP_AGE_RECIPIENT` (the encrypted backup; see "Backups and restore drill" below -- the compose refuses to deploy without them)
 4. Point `api.tinycloud.link` at the deployment's dstack gateway (human DNS step, same pattern as `registry.tinycloud.xyz`): `CNAME api.tinycloud.link -> gateway.<base>`, the CVM's `gateway.cname` from `phala cvms get`. This is unchanged from before TC-85: `dstack-ingress`'s `DOMAIN` stays single-hostname (`api.tinycloud.link`), not a wildcard -- see "Ingress and TLS for tunnels" above for why. Tunnel reachability (`<name>.tinycloud.link`) is handled entirely by the Cloudflare Worker front instead, which needs its own DNS/deploy steps (see "Cloudflare Worker front" above), not a change here.
 5. Verify:
    ```bash
@@ -284,6 +285,55 @@ docker run -p 3000:3000 --env-file .env tinycloud/tinycloud-link
    ```
 
 This build does not attempt any live ACME or DNS calls, and does not deploy to Phala -- both require credentials/auth that only a human on the team holds (see the two blockers above).
+
+## Backups and restore drill
+
+Phala keeps no copy of a CVM's disk, so the Postgres volume (`tinycloud-link-postgres-data`: `names`, `acme_account`, `cert_issuances`) exists only on the CVM. The `postgres-backup` sidecar in `docker-compose.phala.yml` copies it off:
+
+- every 6 h (`BACKUP_INTERVAL_SECONDS=21600`, first run at container start) it runs `pg_dump -Fc`, encrypts with `age` to a **public recipient**, and PUTs `tinycloud-link/tinycloud_link-<UTC stamp>.dump.age` to the Cloudflare R2 bucket `tinycloud-link-backups` over the S3 API. A failed attempt logs `backup: FAILED` and retries after 10 min.
+- The CVM holds only the age **public** recipient. The private key (identity) is held by an operator off-CVM and is never in GitHub, the compose, or Phala. The script refuses to start if given an `AGE-SECRET-KEY-` value.
+- The plaintext dump exists only in a 512 MB tmpfs mounted at `/tmp` (RAM, never the overlay disk) and is deleted before upload. R2 credentials are given to `curl` on stdin, not in its argument list. Uploads send `If-None-Match: *` so an existing object is never overwritten. The service runs with `init: true` and the script traps TERM, so `docker stop` exits promptly.
+- The script is `scripts/link-backup.sh`, baked into the sidecar image built from `Dockerfile.backup` (`postgres:17-alpine` pinned by digest, plus version-pinned `age` and `curl`; nothing is installed at container start). The `Backup Sidecar Image` workflow builds it on every PR and, on `main`, publishes `ghcr.io/tinycloudlabs/tinycloud-link-backup:<sha>` and prints the immutable `@sha256:` reference in the run summary. That reference is the sealed `LINK_BACKUP_IMAGE`. If Alpine drops a pinned package revision the build fails; bump the pins.
+- Retention (14 days) is an R2 lifecycle rule on the bucket, not code.
+
+Sealed env names (all new; set them with the other secrets in step 3 of "Deploy to Phala"):
+
+| Name | Value |
+| --- | --- |
+| `LINK_BACKUP_IMAGE` | `ghcr.io/tinycloudlabs/tinycloud-link-backup@sha256:<digest>` from the workflow summary |
+| `LINK_BACKUP_R2_ENDPOINT` | `https://<cloudflare-account-id>.r2.cloudflarestorage.com` |
+| `LINK_BACKUP_R2_BUCKET` | `tinycloud-link-backups` |
+| `LINK_BACKUP_R2_ACCESS_KEY_ID` | R2 S3 token scoped to that one bucket, Object Read & Write |
+| `LINK_BACKUP_R2_SECRET_ACCESS_KEY` | the matching secret |
+| `LINK_BACKUP_AGE_RECIPIENT` | `age1...` public recipient |
+
+R2 S3 tokens cannot be write-only (permissions are Admin, Object Read & Write, or Object Read only), so a CVM compromise could still delete backups; consider an R2 bucket lock rule (retention >= the lifecycle expiry) if that matters.
+
+One-time setup (operator):
+
+```bash
+age-keygen -o tinycloud-link-backup-identity.txt   # store the file in the operator vault; NEVER upload it
+# the printed "Public key: age1..." is LINK_BACKUP_AGE_RECIPIENT
+```
+
+### Restore drill
+
+Run from an operator machine that has the identity file, `age`, **`curl` 8 or newer** (7.x, e.g. 7.81 on Ubuntu 22.04, does not sign `x-amz-content-sha256` and R2 rejects the request), `psql`, and a `pg_restore` of **major version 17 or newer**. The script checks both versions up front. Docker is needed for the throwaway database (or set `RESTORE_DATABASE_URL` to a disposable database; it is overwritten):
+
+```bash
+export AGE_IDENTITY_FILE=~/vault/tinycloud-link-backup-identity.txt
+export LINK_BACKUP_R2_ENDPOINT=https://<account>.r2.cloudflarestorage.com
+export LINK_BACKUP_R2_BUCKET=tinycloud-link-backups
+export LINK_BACKUP_R2_ACCESS_KEY_ID=...        # read-capable token
+export LINK_BACKUP_R2_SECRET_ACCESS_KEY=...
+RESTORE_EXPECT_MIN_NAMES=1 RESTORE_EXPECT_MIN_ACME_ACCOUNT=1 scripts/link-restore-drill.sh
+```
+
+It downloads the newest `.dump.age`, decrypts it, restores it into a throwaway `postgres:17-alpine` container, and prints `restore-drill: <table> rows = N` for `names`, `acme_account` and `cert_issuances`. Compare the counts with production; run it after the first deploy and on a regular schedule. `--file <dump.age>` restores a specific local backup instead of downloading.
+
+To recover production, restore the same decrypted archive into a fresh Postgres with `pg_restore --clean --if-exists --no-owner -d <url>` before starting `tinycloud-link`.
+
+CI (`Backup & Restore Drill`) runs the real backup script and restore drill against a Postgres 17 service with a local stub standing in for R2. The R2 upload signature itself is only exercised against real R2.
 
 ## Security notes
 
